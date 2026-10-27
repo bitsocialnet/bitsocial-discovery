@@ -1,0 +1,21 @@
+# Example deployment. Point PKC_RPC_URL at a fetch-only bitsocial-cli daemon
+# (README, "Fetch-only node"), never at a node that hosts or seeds communities.
+services:
+  discovery:
+    image: ghcr.io/bitsocialnet/bitsocial-discovery:latest # pin a version tag in production
+    restart: unless-stopped
+    # Loopback only: put a reverse proxy in front if the list is meant to be public.
+    ports:
+      - 127.0.0.1:4100:4100
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    environment:
+      PKC_RPC_URL: ws://host.docker.internal:9138
+      SEEDS_SOURCES: https://raw.githubusercontent.com/bitsocialnet/lists/master/seedit-default-subscriptions.json
+      # OVERRIDES_SOURCE: /app/config/overrides.json
+      # SUBMISSIONS_SOURCE: /app/config/submissions.json
+      # INDEXER_URLS: https://api.seeditarchive.org
+      # ETH_RPC_URL: https://rpc.mevblocker.io
+    extra_hosts:
+      - host.docker.internal:host-gateway

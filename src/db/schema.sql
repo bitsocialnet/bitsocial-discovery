@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS sources (
   first_seen_at INTEGER NOT NULL,
   PRIMARY KEY (address, type, via)
 );
+-- The hourly cap on POST /api/submissions counts recent rows by source.
+CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(type, via, first_seen_at);
 
 -- `author.previousCommentCid` hops already fetched, so a chain is walked once.
 CREATE TABLE IF NOT EXISTS followed_comments (

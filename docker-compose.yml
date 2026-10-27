@@ -15,6 +15,7 @@ services:
       SEEDS_SOURCES: https://raw.githubusercontent.com/bitsocialnet/lists/master/seedit-default-subscriptions.json
       # OVERRIDES_SOURCE: /app/config/overrides.json
       # SUBMISSIONS_SOURCE: /app/config/submissions.json
+      # SUBMISSIONS_PER_HOUR: "20"
       # INDEXER_URLS: https://api.seeditarchive.org
       # ETH_RPC_URL: https://rpc.mevblocker.io
     extra_hosts:

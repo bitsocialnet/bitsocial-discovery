@@ -81,6 +81,60 @@ export function addCandidate(address: string, type: SourceType, via: string, now
   return inserted;
 }
 
+/** `via` of addresses sent to POST /api/submissions, as opposed to a SUBMISSIONS_SOURCE file. */
+export const API_SUBMISSION_VIA = 'api';
+
+const HOUR_SECONDS = 3600;
+
+export type SubmissionResult = { accepted: true } | { accepted: false; retryAfter: number };
+
+/**
+ * Record an address sent to POST /api/submissions, unless the last hour
+ * already took `perHour` new ones. Resubmitting an address is accepted without
+ * using the allowance.
+ */
+export function recordSubmission(address: string, now: number, perHour: number): SubmissionResult {
+  const database = getDb();
+  return database.transaction((): SubmissionResult => {
+    const known = database
+      .prepare("SELECT 1 FROM sources WHERE address = ? AND type = 'submission' AND via = ?")
+      .get(address, API_SUBMISSION_VIA);
+    if (known) return { accepted: true };
+    const recent = database
+      .prepare(
+        `SELECT COUNT(*) AS n, MIN(first_seen_at) AS oldest FROM sources
+           WHERE type = 'submission' AND via = ? AND first_seen_at > ?`,
+      )
+      .get(API_SUBMISSION_VIA, now - HOUR_SECONDS) as { n: number; oldest: number | null };
+    if (recent.n >= perHour) {
+      return { accepted: false, retryAfter: Math.max(1, (recent.oldest ?? now) + HOUR_SECONDS - now) };
+    }
+    addCandidate(address, 'submission', API_SUBMISSION_VIA, now);
+    return { accepted: true };
+  })();
+}
+
+/**
+ * Forget an address that never resolved and that only POST /api/submissions
+ * ever pointed at, so what strangers submit cannot pile up and be rechecked
+ * forever. Returns true when it was dropped.
+ */
+export function dropUnresolvedSubmission(address: string): boolean {
+  const database = getDb();
+  return database.transaction((): boolean => {
+    const { fromApi, total } = database
+      .prepare(
+        `SELECT COALESCE(SUM(type = 'submission' AND via = ?), 0) AS fromApi, COUNT(*) AS total
+           FROM sources WHERE address = ?`,
+      )
+      .get(API_SUBMISSION_VIA, address) as { fromApi: number; total: number };
+    if (total === 0 || fromApi !== total || getCandidate(address)?.last_resolved_at !== null) return false;
+    database.prepare('DELETE FROM sources WHERE address = ?').run(address);
+    database.prepare('DELETE FROM candidates WHERE address = ?').run(address);
+    return true;
+  })();
+}
+
 export function getCandidate(address: string): CandidateRow | undefined {
   return getDb().prepare('SELECT * FROM candidates WHERE address = ?').get(address) as CandidateRow | undefined;
 }

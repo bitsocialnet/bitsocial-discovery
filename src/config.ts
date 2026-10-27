@@ -53,6 +53,11 @@ export const config = {
   seedsSources: list(process.env.SEEDS_SOURCES),
   /** URL/path of a JSON list of operator- or user-submitted addresses. */
   submissionsSource: process.env.SUBMISSIONS_SOURCE ?? '',
+  /**
+   * New addresses `POST /api/submissions` accepts per hour, across all
+   * callers. The cap bounds the fetch work strangers can queue. 0 = no endpoint.
+   */
+  submissionsPerHour: nonNegativeInt(process.env.SUBMISSIONS_PER_HOUR, 0, 'SUBMISSIONS_PER_HOUR'),
   /** Comma-separated bitsocial-indexer API base URLs to read communities and comments from. */
   indexerUrls: list(process.env.INDEXER_URLS),
   /** Ethereum JSON-RPC URL for scanning ENS `bitsocial` text records. Empty = no ENS scan. */
@@ -107,6 +112,7 @@ export function hasConfiguredSources(): boolean {
     config.seeds.length > 0 ||
     config.seedsSources.length > 0 ||
     config.submissionsSource.length > 0 ||
+    config.submissionsPerHour > 0 ||
     config.indexerUrls.length > 0 ||
     config.ethRpcUrl.length > 0
   );

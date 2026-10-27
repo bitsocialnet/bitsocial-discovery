@@ -17,6 +17,7 @@ import { config, hasConfiguredSources } from './config.js';
 import {
   addCandidate,
   deferCandidate,
+  dropUnresolvedSubmission,
   dueCandidates,
   getFollowedComment,
   getState,
@@ -43,6 +44,12 @@ const TICK_MS = 5_000;
 /** Due candidates read per tick, as a multiple of the concurrency. */
 const BATCH_FACTOR = 4;
 const PKC_RECYCLE_TIMEOUT_MS = 10_000;
+/**
+ * Failed checks before an address only the submissions API pointed at, and
+ * that never resolved, is forgotten. About five days with the default backoff,
+ * so a new community whose node is briefly offline still gets in.
+ */
+export const SUBMISSION_GIVE_UP_FAILURES = 10;
 
 /** Seams for tests: the PKC client and the ENS chain. */
 export interface Deps {
@@ -165,6 +172,9 @@ export async function checkCandidate(row: CandidateRow): Promise<void> {
     if (err instanceof TimeoutError) void resetPkcClient();
     const failures = markFailed(address, errorMessage(err), now, now + backoffSeconds((row.failures ?? 0) + 1));
     if (failures === 1) console.log(`[discover] ${address}: ${errorMessage(err)}`);
+    if (failures >= SUBMISSION_GIVE_UP_FAILURES && dropUnresolvedSubmission(address)) {
+      console.log(`[discover] ${address}: dropped, submitted through the API and never resolved`);
+    }
     return;
   }
 
@@ -318,7 +328,9 @@ let sourcesTimer: NodeJS.Timeout | undefined;
 
 export async function startDiscovery(): Promise<void> {
   if (!hasConfiguredSources()) {
-    console.log('[discover] idle — nothing to start from (SEEDS, SEEDS_SOURCES, SUBMISSIONS_SOURCE, INDEXER_URLS, ETH_RPC_URL all empty).');
+    console.log(
+      '[discover] idle — nothing to start from (SEEDS, SEEDS_SOURCES, SUBMISSIONS_SOURCE, SUBMISSIONS_PER_HOUR, INDEXER_URLS, ETH_RPC_URL all empty).',
+    );
     return;
   }
   await refreshSources();

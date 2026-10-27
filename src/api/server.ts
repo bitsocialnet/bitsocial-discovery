@@ -1,11 +1,12 @@
 import { timingSafeEqual } from 'node:crypto';
 import cors from '@fastify/cors';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
-import { normalizeAddress } from '../address.js';
+import { isAddress, normalizeAddress } from '../address.js';
 import { config } from '../config.js';
-import { counts, getState } from '../db/index.js';
+import { counts, getState, recordSubmission } from '../db/index.js';
 import { lastSourcesRefreshAt } from '../discover.js';
 import { REVIEW_STATUSES } from '../overrides.js';
+import { nowSec } from '../util.js';
 import { candidateViews, communityViews, type CommunityView, type Review } from './view.js';
 
 const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -58,6 +59,12 @@ const listQuerySchema = {
   },
 } as const;
 
+const submissionBodySchema = {
+  type: 'object',
+  required: ['address'],
+  properties: { address: { type: 'string', maxLength: 128 } },
+} as const;
+
 /** `review=approved,listed` → the set of statuses to keep, or an error. */
 function parseReviewFilter(value: string | undefined, admin: boolean): Set<Review> | string | null {
   if (value === undefined) return null;
@@ -73,7 +80,7 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   await app.register(cors, {
     origin: parseAllowedOrigins(config.allowedOrigins),
-    methods: ['GET', 'HEAD'],
+    methods: ['GET', 'HEAD', 'POST'],
   });
 
   app.get('/api/health', async () => ({
@@ -122,6 +129,31 @@ export async function buildServer(): Promise<FastifyInstance> {
     const candidates = candidateViews();
     return { candidates, total: candidates.length };
   });
+
+  /**
+   * Anyone can propose an address, such as a community with no name that
+   * nothing links to yet. It becomes an ordinary candidate: listed once it
+   * resolves, and subject to the review file. Off unless SUBMISSIONS_PER_HOUR
+   * is set.
+   */
+  if (config.submissionsPerHour > 0) {
+    app.post('/api/submissions', { bodyLimit: 1024, schema: { body: submissionBodySchema } }, async (req, reply) => {
+      const raw = (req.body as { address: string }).address;
+      if (!isAddress(raw)) {
+        return reply.code(400).send({ error: 'expected a .bso or .eth name, or an IPNS public key' });
+      }
+      const address = normalizeAddress(raw);
+      const result = recordSubmission(address, nowSec(), config.submissionsPerHour);
+      if (!result.accepted) {
+        return reply
+          .code(429)
+          .header('retry-after', String(result.retryAfter))
+          .send({ error: 'too many submissions this hour, try again later' });
+      }
+      // The same answer for new and known addresses, so it reveals nothing the list hides.
+      return reply.code(202).send({ address });
+    });
+  }
 
   return app;
 }

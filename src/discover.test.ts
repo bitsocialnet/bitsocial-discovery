@@ -1,8 +1,16 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 import { config } from './config.js';
-import { addCandidate, deferCandidate, getCandidate, getDb, resetDbForTest, sourcesByAddress } from './db/index.js';
-import { backoffSeconds, refreshSources, setDepsForTest, tick } from './discover.js';
+import {
+  addCandidate,
+  deferCandidate,
+  getCandidate,
+  getDb,
+  recordSubmission,
+  resetDbForTest,
+  sourcesByAddress,
+} from './db/index.js';
+import { backoffSeconds, refreshSources, setDepsForTest, SUBMISSION_GIVE_UP_FAILURES, tick } from './discover.js';
 import { parseOverrides, setOverrides } from './overrides.js';
 import type { PkcClient } from './pkc/client.js';
 import { nowSec } from './util.js';
@@ -132,6 +140,26 @@ test('a failing candidate backs off exponentially and keeps its error', async ()
   assert.equal(row.failures, 2);
   assert.equal(backoffSeconds(2), backoffSeconds(1) * 2);
   assert.equal(backoffSeconds(1_000), Math.ceil(config.retryMaxMs / 1000));
+});
+
+test('an address only the submissions API pointed at is dropped after repeated failures; one also found elsewhere is kept', async () => {
+  fakePkc({});
+  recordSubmission('ghost.bso', nowSec(), 10);
+  recordSubmission('linked.bso', nowSec(), 10);
+  addCandidate('linked.bso', 'mention', 'seed.bso', nowSec());
+  const failAll = async () => {
+    makeDue('ghost.bso');
+    makeDue('linked.bso');
+    await tick();
+  };
+
+  for (let i = 1; i < SUBMISSION_GIVE_UP_FAILURES; i++) await failAll();
+  assert.equal(getCandidate('ghost.bso')?.failures, SUBMISSION_GIVE_UP_FAILURES - 1);
+
+  await failAll();
+  assert.equal(getCandidate('ghost.bso'), undefined);
+  assert.deepEqual(sourcesOf('ghost.bso'), []);
+  assert.equal(getCandidate('linked.bso')?.failures, SUBMISSION_GIVE_UP_FAILURES);
 });
 
 test('a blocked address is never fetched; a blocked key is stored but not harvested', async () => {

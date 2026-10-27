@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 import { config } from '../config.js';
-import { addCandidate, getDb, markResolved, resetDbForTest, upsertCommunity } from '../db/index.js';
+import { addCandidate, getCandidate, getDb, markResolved, resetDbForTest, sourcesByAddress, upsertCommunity } from '../db/index.js';
 import { parseOverrides, setOverrides } from '../overrides.js';
 import { buildServer, parseAllowedOrigins } from './server.js';
 
@@ -57,6 +57,7 @@ afterEach(() => {
   setOverrides(new Map());
   mutableConfig.publicListing = 'all';
   mutableConfig.adminToken = '';
+  mutableConfig.submissionsPerHour = 0;
 });
 
 async function get(url: string, headers: Record<string, string> = {}) {
@@ -64,6 +65,16 @@ async function get(url: string, headers: Record<string, string> = {}) {
   try {
     const res = await app.inject({ method: 'GET', url, headers });
     return { status: res.statusCode, body: res.json() };
+  } finally {
+    await app.close();
+  }
+}
+
+async function submit(payload: unknown) {
+  const app = await buildServer();
+  try {
+    const res = await app.inject({ method: 'POST', url: '/api/submissions', payload: payload as object });
+    return { status: res.statusCode, body: res.json(), headers: res.headers };
   } finally {
     await app.close();
   }
@@ -128,6 +139,52 @@ test('a single community is found by any alias, and hidden ones are not found pu
   assert.equal((await get(`/api/communities/${KEY_A}`)).body.address, 'memes.bso');
   assert.equal((await get('/api/communities/MEMES.bso')).body.publicKey, KEY_A);
   assert.equal((await get('/api/communities/secret.bso')).status, 404);
+});
+
+test('the submissions endpoint does not exist unless SUBMISSIONS_PER_HOUR is set', async () => {
+  assert.equal((await submit({ address: 'new.bso' })).status, 404);
+  assert.equal(getCandidate('new.bso'), undefined);
+});
+
+test('a submitted address becomes a candidate credited to the API', async () => {
+  mutableConfig.submissionsPerHour = 5;
+  const res = await submit({ address: ' NEW.bso ' });
+  assert.equal(res.status, 202);
+  assert.deepEqual(res.body, { address: 'new.bso' });
+  assert.ok(getCandidate('new.bso'));
+  assert.deepEqual(sourcesByAddress().get('new.bso')?.map((s) => `${s.type}:${s.via}`), ['submission:api']);
+
+  assert.equal((await submit({ address: 'https://example.com' })).status, 400);
+  assert.equal((await submit({})).status, 400);
+});
+
+test('the hourly cap refuses new addresses but still accepts a resubmission', async () => {
+  mutableConfig.submissionsPerHour = 2;
+  assert.equal((await submit({ address: 'one.bso' })).status, 202);
+  assert.equal((await submit({ address: 'two.bso' })).status, 202);
+
+  const limited = await submit({ address: 'three.bso' });
+  assert.equal(limited.status, 429);
+  const retryAfter = Number(limited.headers['retry-after']);
+  assert.ok(retryAfter >= 1 && retryAfter <= 3600);
+  assert.equal(getCandidate('three.bso'), undefined);
+
+  assert.equal((await submit({ address: 'one.bso' })).status, 202);
+});
+
+test('CORS preflight allows POST so a page on another origin can submit', async () => {
+  mutableConfig.submissionsPerHour = 1;
+  const app = await buildServer();
+  try {
+    const res = await app.inject({
+      method: 'OPTIONS',
+      url: '/api/submissions',
+      headers: { origin: 'https://seedit.app', 'access-control-request-method': 'POST' },
+    });
+    assert.match(String(res.headers['access-control-allow-methods']), /POST/);
+  } finally {
+    await app.close();
+  }
 });
 
 test('parseAllowedOrigins matches bitsocial-indexer: "*" is any origin, wildcards stay inside the host', () => {

@@ -17,7 +17,7 @@ and follows the pointers communities leave to each other.
 | Source | Config | What it reads |
 |---|---|---|
 | Seeds | `SEEDS`, `SEEDS_SOURCES` | Addresses, or JSON lists such as [`bitsocialnet/lists`](https://github.com/bitsocialnet/lists) files |
-| Submissions | `SUBMISSIONS_SOURCE` | A JSON list of addresses people sent the operator |
+| Submissions | `SUBMISSIONS_SOURCE`, `SUBMISSIONS_PER_HOUR` | A JSON list of addresses people sent the operator, and addresses posted to `POST /api/submissions` |
 | Indexers | `INDEXER_URLS` | A [bitsocial-indexer](https://github.com/bitsocialnet/bitsocial-indexer) API: its communities, and the signed comments it archived |
 | ENS | `ETH_RPC_URL` | Every ENS name whose resolver ever set a `bitsocial` text record (how `.bso` names resolve) |
 | Mentions | always on | Addresses written in community descriptions, rules, post titles, bodies and links |
@@ -99,6 +99,7 @@ lists every one with its default.
 | `SEEDS` | _(empty)_ | Comma-separated addresses to start from |
 | `SEEDS_SOURCES` | _(empty)_ | Comma-separated URLs/paths of JSON lists: `["a.bso", …]`, `{ "communities": [...] }` or `{ "boards": [...] }`; entries' `address` and `publicKey` are both used |
 | `SUBMISSIONS_SOURCE` | _(empty)_ | Same format; recorded as `submission` |
+| `SUBMISSIONS_PER_HOUR` | `0` | New addresses `POST /api/submissions` accepts per hour, across all callers; `0` = no endpoint (below) |
 | `INDEXER_URLS` | _(empty)_ | Comma-separated bitsocial-indexer API base URLs |
 | `ETH_RPC_URL` | _(empty)_ | Ethereum JSON-RPC for the ENS scan; empty = no scan |
 | `ENS_FROM_BLOCK` | `23085558` | First block scanned when no cursor is saved |
@@ -158,11 +159,12 @@ admin requests. The file is re-read whenever it changes.
 
 ## API
 
-CORS-enabled, read-only.
+CORS-enabled. Read-only, except `POST /api/submissions` when it is turned on.
 
 | Endpoint | Description |
 |---|---|
 | `GET /api/health` | Counts, last source refresh, ENS cursor |
+| `POST /api/submissions` | Propose a community address (below). Only exists when `SUBMISSIONS_PER_HOUR` is above 0 |
 | `GET /api/communities` | Resolved communities. `sort=new\|updated\|created\|title` (`new` = first resolved by this instance), `review=approved,listed,unreviewed`, `pseudonymous=true\|false`, `nsfw=true\|false`, `uiType` (default leaves out `author` profiles; `any` = all), `limit` + `page` (no `limit` = everything) |
 | `GET /api/communities/:address` | One community, by name, key or alias |
 | `GET /api/candidates` | Admin only: every known address with its check state, error and sources |
@@ -171,6 +173,32 @@ Each community carries `address`, `publicKey`, `name`, `aliases`, `title`,
 `description`, `createdAt`, `updatedAt`, `firstSeenAt`, `lastResolvedAt`,
 `pseudonymityMode`, `safeForWork`, `uiType`, `review`, `nsfw`
 (`true`/`false`/`null`) and `sources` (`type`, `via`, `firstSeenAt`).
+
+### Submissions
+
+A community with no name, that no list carries and nothing links to, has no
+other way in. Anyone can send its address:
+
+```bash
+curl -s -X POST http://127.0.0.1:4100/api/submissions \
+  -H 'content-type: application/json' \
+  -d '{"address":"12D3KooW…"}'
+```
+
+The body is `{ "address": … }`: a `.bso`/`.eth` name or an IPNS public key.
+The answer is `202 { "address": … }` for new and already-known addresses
+alike, `400` for anything that is not an address, and `429` with `Retry-After`
+once the last hour took `SUBMISSIONS_PER_HOUR` new addresses. Resubmitting an
+address never uses the allowance.
+
+A submission becomes an ordinary candidate recorded as `submission` via `api`:
+it is listed only once it resolves, and the review file applies to it like any
+other. An address that only the API ever pointed at and that fails 10 checks
+in a row without ever resolving (about five days with the default backoff) is
+forgotten and can be submitted again. The cap is global, not per caller, so it
+bounds the fetch work strangers can queue; one caller can still use up an
+hour's allowance. The API listens on loopback by default, so a reverse proxy
+decides whether the endpoint is reachable from outside.
 
 ### Feeding an indexer
 

@@ -42,8 +42,15 @@ export interface CommunityView {
 function view(row: CommunityRow, aliases: string[], sources: Map<string, SourceRow[]>, admin: boolean): CommunityView {
   const addresses = [...new Set([row.address, row.public_key, ...(row.name ? [row.name] : []), ...aliases])];
   const override = overrideFor(addresses);
-  const found = addresses
-    .flatMap((a) => sources.get(a) ?? [])
+  // A pointer names a community by both its name and its key, so the same
+  // (type, via) is recorded once per alias; show it once, at its earliest.
+  const earliest = new Map<string, SourceRow>();
+  for (const s of addresses.flatMap((a) => sources.get(a) ?? [])) {
+    const key = `${s.type}\u0000${s.via}`;
+    const seen = earliest.get(key);
+    if (!seen || s.first_seen_at < seen.first_seen_at) earliest.set(key, s);
+  }
+  const found = [...earliest.values()]
     .sort((a, b) => a.first_seen_at - b.first_seen_at)
     .map((s) => ({ type: s.type, via: s.via, firstSeenAt: s.first_seen_at }));
   const safeForWork = row.safe_for_work === null ? null : row.safe_for_work === 1;

@@ -35,6 +35,9 @@ beforeEach(() => {
   // Found as a name and as its key: one community, two aliases.
   addCandidate('memes.bso', 'seed', 'lists', 10);
   addCandidate(KEY_A, 'ens', '0xnode', 20);
+  // The same pointer recorded under both aliases is one source.
+  addCandidate('memes.bso', 'crosspost', 'board.bso', 25);
+  addCandidate(KEY_A, 'crosspost', 'board.bso', 24);
   markResolved('memes.bso', KEY_A, 30, 99);
   markResolved(KEY_A, KEY_A, 30, 99);
   community(KEY_A, 'memes.bso', { title: 'Memes', updated_at: 500, safe_for_work: 1 });
@@ -71,7 +74,10 @@ test('the public list hides hidden communities and profiles, and merges aliases'
   assert.deepEqual(body.communities.map((c: { address: string }) => c.address), ['board.bso', 'memes.bso']);
   const memes = body.communities[1];
   assert.deepEqual(memes.aliases, [KEY_A, 'memes.bso'].sort());
-  assert.deepEqual(memes.sources.map((s: { type: string }) => s.type), ['seed', 'ens']);
+  assert.deepEqual(
+    memes.sources.map((s: { type: string; firstSeenAt: number }) => `${s.type}@${s.firstSeenAt}`),
+    ['seed@10', 'ens@20', 'crosspost@24'],
+  );
   assert.equal(memes.review, 'approved');
   assert.equal(memes.nsfw, false);
   assert.equal(body.communities[0].nsfw, true);

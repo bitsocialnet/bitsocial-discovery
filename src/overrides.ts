@@ -73,21 +73,37 @@ export function setOverrides(next: Map<string, Override>): void {
   overrides = next;
 }
 
+/** The verdicts a name passes on to a record that claims it without proof: only restrictions. */
+const CLAIM_STATUSES: readonly ReviewStatus[] = ['blocked', 'hidden'];
+
 /**
  * The combined verdict for one community, given every address it is known by.
  * Status: the most restrictive any alias carries. NSFW: true if any alias says
  * so, false only if one says false and none says true.
+ *
+ * `claims` are names the community's record claims that are not verified to
+ * resolve to it. They only make the verdict stricter (blocked, hidden, NSFW):
+ * a record cannot take on the approval of a name it may not own, and cannot
+ * escape a block on a name that is never fetched and so never verified.
  */
-export function overrideFor(addresses: Iterable<string>): Override {
+export function overrideFor(addresses: Iterable<string>, claims: Iterable<string> = []): Override {
   let status: ReviewStatus | undefined;
   let nsfw: boolean | undefined;
   const reasons: string[] = [];
-  for (const address of addresses) {
-    const o = overrides.get(normalizeAddress(address));
-    if (!o) continue;
+  const apply = (o: Override): void => {
     if (o.status && (!status || PRECEDENCE.indexOf(o.status) < PRECEDENCE.indexOf(status))) status = o.status;
     if (o.nsfw !== undefined) nsfw = nsfw === true || o.nsfw;
     if (o.reason) reasons.push(o.reason);
+  };
+  for (const address of addresses) {
+    const o = overrides.get(normalizeAddress(address));
+    if (o) apply(o);
+  }
+  for (const address of claims) {
+    const o = overrides.get(normalizeAddress(address));
+    const restricts = o?.status !== undefined && CLAIM_STATUSES.includes(o.status);
+    if (!o || (!restricts && o.nsfw !== true)) continue;
+    apply({ status: restricts ? o.status : undefined, nsfw: o.nsfw || undefined, reason: o.reason });
   }
   return {
     ...(status ? { status } : {}),

@@ -19,6 +19,7 @@ import {
   deferCandidate,
   dropUnresolvedSubmission,
   dueCandidates,
+  getCandidate,
   getFollowedComment,
   getState,
   hasCommunity,
@@ -151,6 +152,23 @@ function num(value: unknown): number | null {
 }
 
 /**
+ * Whether the name a community record claims is really its name. pkc-js
+ * answers getCommunity before it has checked the claim of a record loaded by
+ * key (`nameResolved` is still undefined then, and stays so when no resolver
+ * answers), so undefined is no verdict: the name is trusted only when pkc-js
+ * confirmed it, when this check loaded the community through that very name,
+ * or when discovery already resolved that name to this key. For a record
+ * loaded by name, `nameResolved` is pkc-js's verdict on that name, not on the
+ * claim.
+ */
+function isVerifiedName(claimed: string, address: string, publicKey: string, nameResolved: unknown): boolean {
+  if (nameResolved === false) return false;
+  if (claimed === address) return true;
+  if (nameResolved === true && !/\.(?:bso|eth)$/.test(address)) return true;
+  return getCandidate(claimed)?.public_key === publicKey;
+}
+
+/**
  * Fetch one candidate and record what it is. Blocked communities are never
  * fetched again once known, and are never harvested.
  */
@@ -184,13 +202,17 @@ export async function checkCandidate(row: CandidateRow): Promise<void> {
     markFailed(address, 'community has no public key', now, now + backoffSeconds((row.failures ?? 0) + 1));
     return;
   }
-  // A record can claim any name; only one that resolves back to this key is its address.
-  const name = community?.nameResolved === false ? null : str(community?.name);
+  // A record can claim any name; only one that resolves back to this key is its address. An
+  // unverified claim is kept aside: a block or hide on that name still applies, its approval does not.
+  const claimed = str(community?.name) ? normalizeAddress(community.name) : null;
+  const name = claimed && isVerifiedName(claimed, address, publicKey, community?.nameResolved) ? claimed : null;
+  const unverified = name ? null : claimed;
   const isNew = !hasCommunity(publicKey);
   upsertCommunity({
     public_key: publicKey,
-    address: name ? normalizeAddress(name) : publicKey,
-    name: name ? normalizeAddress(name) : null,
+    address: name ?? publicKey,
+    name,
+    claimed_name: unverified,
     title: str(community?.title),
     description: str(community?.description),
     created_at: num(community?.createdAt),
@@ -203,8 +225,12 @@ export async function checkCandidate(row: CandidateRow): Promise<void> {
   markResolved(address, publicKey, now, now + Math.ceil(config.recheckIntervalMs / 1000));
   if (isNew) console.log(`[discover] resolved ${address}${name && name !== address ? ` (${name})` : ''}`);
 
-  if (overrideFor([...known, publicKey, ...(name ? [name] : [])]).status === 'blocked') return;
-  const added = await expand(harvestCommunity(community), name ?? publicKey, deadline);
+  const claims = unverified ? [unverified] : [];
+  if (overrideFor([...known, publicKey, ...(name ? [name] : [])], claims).status === 'blocked') return;
+  const harvest = harvestCommunity(community);
+  // An unverified name is checked on its own; once it resolves to this key, it is the address.
+  if (unverified && isAddress(unverified)) harvest.mentions.add(unverified);
+  const added = await expand(harvest, name ?? publicKey, deadline);
   if (added) console.log(`[discover] ${name ?? address}: ${added} new candidates`);
 }
 

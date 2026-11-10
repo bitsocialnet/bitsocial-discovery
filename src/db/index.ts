@@ -38,6 +38,8 @@ export interface CommunityRow {
   ui_type: string | null;
   first_seen_at: number;
   last_resolved_at: number;
+  /** A name the record claims that is not verified to resolve to it: only a block or hide on it applies. */
+  claimed_name: string | null;
 }
 
 export interface SourceRow {
@@ -57,7 +59,44 @@ export function getDb(): Database.Database {
   db.pragma('busy_timeout = 5000');
   const here = dirname(fileURLToPath(import.meta.url));
   db.exec(readFileSync(join(here, 'schema.sql'), 'utf8'));
+  migrate(db);
   return db;
+}
+
+/**
+ * Add the columns schema.sql gained since a database was created: its
+ * CREATE TABLE IF NOT EXISTS leaves an existing table as it is.
+ *
+ * Versions without communities.claimed_name stored whatever name a record
+ * claimed as its address, and a row is only rewritten by a check that
+ * succeeds, so a community that stays offline would keep a name it may not
+ * own, and that name's verdict, for good. When the column is added, a name
+ * no candidate resolved to the same key moves to it, and the community's
+ * candidates are due at once so a name it does own is soon verified again.
+ * Only then: later rows hold names pkc-js verified without a candidate.
+ */
+function migrate(database: Database.Database): void {
+  const columns = database.prepare('PRAGMA table_info(communities)').all() as { name: string }[];
+  if (columns.some((c) => c.name === 'claimed_name')) return;
+  const demoted = database.transaction((): number => {
+    database.exec('ALTER TABLE communities ADD COLUMN claimed_name TEXT');
+    const changes = database
+      .prepare(
+        `UPDATE communities SET claimed_name = name, name = NULL, address = public_key
+           WHERE name IS NOT NULL AND NOT EXISTS (
+             SELECT 1 FROM candidates WHERE candidates.address = communities.name
+               AND candidates.public_key = communities.public_key)`,
+      )
+      .run().changes;
+    database
+      .prepare(
+        `UPDATE candidates SET next_check_at = @now WHERE next_check_at > @now
+           AND public_key IN (SELECT public_key FROM communities WHERE claimed_name IS NOT NULL)`,
+      )
+      .run({ now: Math.floor(Date.now() / 1000) });
+    return changes;
+  })();
+  if (demoted) console.log(`[db] ${demoted} unverified community names moved from address to claimed_name`);
 }
 
 /** Drop the connection so the next getDb() starts from an empty in-memory database. Tests only. */
@@ -169,21 +208,23 @@ export function deferCandidate(address: string, nextCheckAt: number): void {
   getDb().prepare('UPDATE candidates SET next_check_at = ? WHERE address = ?').run(nextCheckAt, address);
 }
 
-export function upsertCommunity(row: Omit<CommunityRow, 'first_seen_at'>): void {
+export function upsertCommunity(
+  row: Omit<CommunityRow, 'first_seen_at' | 'claimed_name'> & { claimed_name?: string | null },
+): void {
   getDb()
     .prepare(
       `INSERT INTO communities (public_key, address, name, title, description, created_at, updated_at,
-         pseudonymity_mode, safe_for_work, ui_type, first_seen_at, last_resolved_at)
+         pseudonymity_mode, safe_for_work, ui_type, first_seen_at, last_resolved_at, claimed_name)
        VALUES (@public_key, @address, @name, @title, @description, @created_at, @updated_at,
-         @pseudonymity_mode, @safe_for_work, @ui_type, @last_resolved_at, @last_resolved_at)
+         @pseudonymity_mode, @safe_for_work, @ui_type, @last_resolved_at, @last_resolved_at, @claimed_name)
        ON CONFLICT(public_key) DO UPDATE SET
          address = excluded.address, name = excluded.name, title = excluded.title,
          description = excluded.description, created_at = excluded.created_at,
          updated_at = excluded.updated_at, pseudonymity_mode = excluded.pseudonymity_mode,
          safe_for_work = excluded.safe_for_work, ui_type = excluded.ui_type,
-         last_resolved_at = excluded.last_resolved_at`,
+         last_resolved_at = excluded.last_resolved_at, claimed_name = excluded.claimed_name`,
     )
-    .run(row);
+    .run({ ...row, claimed_name: row.claimed_name ?? null });
 }
 
 export function hasCommunity(publicKey: string): boolean {

@@ -41,7 +41,8 @@ export interface CommunityView {
 
 function view(row: CommunityRow, aliases: string[], sources: Map<string, SourceRow[]>, admin: boolean): CommunityView {
   const addresses = [...new Set([row.address, row.public_key, ...(row.name ? [row.name] : []), ...aliases])];
-  const override = overrideFor(addresses);
+  // A name the record claims without proof can only restrict it (see overrideFor).
+  const override = overrideFor(addresses, row.claimed_name ? [row.claimed_name] : []);
   // A pointer names a community by both its name and its key, so the same
   // (type, via) is recorded once per alias; show it once, at its earliest.
   const earliest = new Map<string, SourceRow>();

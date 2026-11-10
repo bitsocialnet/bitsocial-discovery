@@ -31,6 +31,24 @@ test('overrideFor merges aliases: strictest status, NSFW if any alias says so', 
   setOverrides(new Map());
 });
 
+test('overrideFor takes only restrictions from a name a record claims without proof', () => {
+  setOverrides(
+    parseOverrides([
+      { address: 'approved.bso', status: 'approved', nsfw: false },
+      { address: 'listed.bso', status: 'listed', nsfw: true },
+      { address: 'hidden.bso', status: 'hidden', reason: 'spam' },
+      { address: 'blocked.bso', status: 'blocked' },
+      { address: 'key', status: 'listed', nsfw: false },
+    ]),
+  );
+  assert.deepEqual(overrideFor(['key'], ['approved.bso']), { status: 'listed', nsfw: false });
+  assert.deepEqual(overrideFor(['key'], ['listed.bso']), { status: 'listed', nsfw: true });
+  assert.deepEqual(overrideFor(['key'], ['hidden.bso']), { status: 'hidden', nsfw: false, reason: 'spam' });
+  assert.deepEqual(overrideFor([], ['blocked.bso']), { status: 'blocked' });
+  assert.deepEqual(overrideFor([], ['approved.bso']), {});
+  setOverrides(new Map());
+});
+
 test('pollOverrides applies the file, reloads it on change and clears it when deleted', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'discovery-overrides-'));
   const file = join(dir, 'overrides.json');

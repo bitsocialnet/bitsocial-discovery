@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
+import { communityViews } from './api/view.js';
 import { config } from './config.js';
 import {
   addCandidate,
@@ -18,6 +19,7 @@ import { nowSec } from './util.js';
 const KEY_A = '12D3KooWNv5HzmkcKZkxMn1SrfMyozTdTJSr7kA1bzEKKa7PTS5N';
 const KEY_B = '12D3KooWFkZorC92RxQAwMBYMido8xBM88ghpLWA26mrE9W9Xmxd';
 const KEY_C = '12D3KooWFL5oGc9p9CYs25eeK5cCpPXXhibECsnqmuxinq2jbtjP';
+const KEY_D = '12D3KooWCqU7kP2fJwaDrV8mQ3gKxbEsW9nR4hLycFtXAoS5iMzd';
 const CID_1 = 'QmULtQscGrFmc4qcZDbsZMFxyJT1qT3qQVZ28Vc1YhbwLq';
 const CID_2 = 'QmemhNu7rQum2TCKHJn1h7UqUmtRV1jtcdLXNfoXCt7nn5';
 
@@ -187,6 +189,78 @@ test('a name the record claims but does not resolve to its key is not used as th
   await tick();
   const row = getDb().prepare('SELECT address, name FROM communities').get() as { address: string; name: string | null };
   assert.deepEqual({ ...row }, { address: KEY_B, name: null });
+});
+
+function storedAddress(publicKey: string): { address: string; name: string | null } | undefined {
+  const row = getDb().prepare('SELECT address, name FROM communities WHERE public_key = ?').get(publicKey);
+  return row ? { ...(row as { address: string; name: string | null }) } : undefined;
+}
+
+test('a name a key-loaded record claims becomes its address only once it is verified', async () => {
+  setOverrides(parseOverrides([{ address: 'memes.bso', status: 'approved' }]));
+  // pkc-js answers before it has checked a key-loaded record's name, so nameResolved is
+  // usually still undefined: the claim is unverified.
+  fakePkc({
+    'memes.bso': { name: 'memes.bso', publicKey: KEY_A, title: 'Memes' },
+    [KEY_B]: { name: 'memes.bso', publicKey: KEY_B, title: 'Not memes' },
+    [KEY_C]: { name: 'real.bso', publicKey: KEY_C, title: 'Real' },
+    'real.bso': { name: 'real.bso', publicKey: KEY_C, title: 'Real' },
+    [KEY_D]: { name: 'checked.bso', nameResolved: true, publicKey: KEY_D },
+  });
+  addCandidate('memes.bso', 'seed', 'SEEDS', nowSec());
+  addCandidate(KEY_B, 'submission', 'api', nowSec());
+  addCandidate(KEY_C, 'ens', '0xnode', nowSec());
+  addCandidate(KEY_D, 'ens', '0xnode', nowSec());
+  await tick();
+
+  // Another key claiming memes.bso is listed under its own key, without memes.bso's verdict.
+  assert.deepEqual(storedAddress(KEY_B), { address: KEY_B, name: null });
+  assert.deepEqual(storedAddress(KEY_A), { address: 'memes.bso', name: 'memes.bso' });
+  const reviews = Object.fromEntries(communityViews(true).map((c) => [c.publicKey, c.review]));
+  assert.equal(reviews[KEY_A], 'approved');
+  assert.equal(reviews[KEY_B], 'unreviewed');
+  // A name pkc-js has verified is used at once.
+  assert.deepEqual(storedAddress(KEY_D), { address: 'checked.bso', name: 'checked.bso' });
+
+  // An unverified name is checked on its own, and once it resolves to the key it is the address.
+  assert.deepEqual(storedAddress(KEY_C), { address: KEY_C, name: null });
+  assert.deepEqual(sourcesOf('real.bso'), [`mention:${KEY_C}`]);
+  await tick();
+  assert.deepEqual(storedAddress(KEY_C), { address: 'real.bso', name: 'real.bso' });
+  makeDue(KEY_C);
+  await tick();
+  assert.deepEqual(storedAddress(KEY_C), { address: 'real.bso', name: 'real.bso' });
+});
+
+test('a block or hide on a name a record claims applies before the name is verified', async () => {
+  setOverrides(
+    parseOverrides([
+      { address: 'spam.bso', status: 'blocked', reason: 'report' },
+      { address: 'quiet.bso', status: 'hidden', nsfw: true },
+    ]),
+  );
+  // A list entry naming a community by name and key: the blocked name is never fetched, so the
+  // key's claim to it can never be verified.
+  const calls = fakePkc({
+    [KEY_C]: { name: 'spam.bso', publicKey: KEY_C, description: 'see leak.bso' },
+    [KEY_D]: { name: 'quiet.bso', publicKey: KEY_D, description: 'see next.bso' },
+  });
+  addCandidate('spam.bso', 'seed', 'list.json', nowSec());
+  addCandidate(KEY_C, 'seed', 'list.json', nowSec());
+  addCandidate(KEY_D, 'ens', '0xnode', nowSec());
+  await tick();
+  assert.deepEqual([...calls.communities].sort(), [KEY_C, KEY_D].sort());
+
+  // Neither takes the claimed name as its address, but both keep its restriction.
+  assert.deepEqual(storedAddress(KEY_C), { address: KEY_C, name: null });
+  assert.deepEqual(storedAddress(KEY_D), { address: KEY_D, name: null });
+  const views = communityViews(true);
+  assert.deepEqual(Object.fromEntries(views.map((c) => [c.publicKey, c.review])), { [KEY_C]: 'blocked', [KEY_D]: 'hidden' });
+  assert.equal(views.find((c) => c.publicKey === KEY_C)?.reason, 'report');
+  assert.equal(views.find((c) => c.publicKey === KEY_D)?.nsfw, true);
+  assert.deepEqual(communityViews(false), [], 'neither is listed publicly');
+  assert.equal(getCandidate('leak.bso'), undefined, 'a blocked community is not harvested');
+  assert.deepEqual(sourcesOf('next.bso'), [`mention:${KEY_D}`], 'a hidden one still is');
 });
 
 test('refreshSources reads indexer communities and credits comment pointers to their community', async () => {

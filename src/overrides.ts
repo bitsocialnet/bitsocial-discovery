@@ -28,7 +28,8 @@
 import { readFile, stat } from 'node:fs/promises';
 import { normalizeAddress } from './address.js';
 import { config } from './config.js';
-import { errorMessage } from './util.js';
+import { getState, requeueCandidatesOf, setState } from './db/index.js';
+import { errorMessage, nowSec } from './util.js';
 
 export const REVIEW_STATUSES = ['approved', 'listed', 'hidden', 'blocked'] as const;
 export type ReviewStatus = (typeof REVIEW_STATUSES)[number];
@@ -116,6 +117,35 @@ export function overrideFor(addresses: Iterable<string>, claims: Iterable<string
 let lastMtimeMs: number | null = null; // null = never loaded, -1 = file absent
 let timer: NodeJS.Timeout | undefined;
 
+/** The `state` row holding the addresses the last applied verdicts block. */
+const APPLIED_BLOCKS_STATE = 'overrides:blocked';
+
+function blockedIn(verdicts: Map<string, Override>): string[] {
+  return [...verdicts].filter(([, o]) => o.status === 'blocked').map(([address]) => address);
+}
+
+/**
+ * Swap in the verdicts of a reloaded file. Discovery pushes a blocked
+ * candidate back by RETRY_MAX_MS whenever it comes due, and nothing else
+ * brings it forward, so lifting a block makes that community due at once.
+ * The blocks applied last are also kept in the database: after a restart the
+ * previous verdicts are not in memory, and a block lifted while the service
+ * was down has to count as lifted too.
+ */
+function applyOverrides(next: Map<string, Override>): void {
+  const before = new Set(blockedIn(overrides));
+  setOverrides(next);
+  try {
+    const saved = getState(APPLIED_BLOCKS_STATE);
+    for (const address of saved ? (JSON.parse(saved) as string[]) : []) before.add(address);
+    const lifted = [...before].filter((address) => next.get(address)?.status !== 'blocked');
+    if (lifted.length) requeueCandidatesOf(lifted, nowSec());
+    setState(APPLIED_BLOCKS_STATE, JSON.stringify(blockedIn(next)));
+  } catch (err) {
+    console.error(`[overrides] could not re-queue unblocked communities: ${errorMessage(err)}`);
+  }
+}
+
 /** Check the file's mtime and (re)apply it when it changed. Exported for tests. */
 export async function pollOverrides(source = config.overridesSource): Promise<void> {
   if (!source) return;
@@ -129,18 +159,20 @@ export async function pollOverrides(source = config.overridesSource): Promise<vo
       console.error(`[overrides] cannot read ${source}: ${errorMessage(err)}`);
       return;
     }
-    if (lastMtimeMs !== -1) {
-      if (lastMtimeMs !== null) console.log(`[overrides] ${source} is gone — overrides cleared`);
-      lastMtimeMs = -1;
-      setOverrides(new Map());
+    // Never loaded: nothing to clear, and startOverrides refuses to start, so the blocks the
+    // last run applied stay recorded for the run that loads the file.
+    if (lastMtimeMs !== null && lastMtimeMs !== -1) {
+      console.log(`[overrides] ${source} is gone — overrides cleared`);
+      applyOverrides(new Map());
     }
+    lastMtimeMs = -1;
     return;
   }
   if (mtimeMs === lastMtimeMs) return;
   try {
     const next = parseOverrides(JSON.parse(await readFile(source, 'utf8')));
     lastMtimeMs = mtimeMs;
-    setOverrides(next);
+    applyOverrides(next);
     console.log(`[overrides] applied ${next.size} entries from ${source}`);
   } catch (err) {
     console.error(`[overrides] failed to load ${source}: ${errorMessage(err)}`);
@@ -154,7 +186,11 @@ export async function pollOverrides(source = config.overridesSource): Promise<vo
  */
 export async function startOverrides(): Promise<void> {
   const source = config.overridesSource;
-  if (!source) return;
+  if (!source) {
+    // No review file any more: the blocks an earlier run applied are lifted.
+    applyOverrides(new Map());
+    return;
+  }
   lastMtimeMs = null;
   await pollOverrides(source);
   if (lastMtimeMs === null || lastMtimeMs === -1) {

@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS followed_comments (
 );
 
 -- Cursors: the ENS block reached, the newest comment read from each indexer.
+-- Also the addresses the review file blocked when it was last applied.
 CREATE TABLE IF NOT EXISTS state (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL

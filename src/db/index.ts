@@ -285,6 +285,31 @@ export function claimsOfKey(publicKey: string): string[] {
   return row?.claimed_name ? [row.claimed_name] : [];
 }
 
+/**
+ * Make every candidate of the communities known by any of `addresses` due
+ * now: the addresses themselves and every candidate sharing a key with one of
+ * them, the same aliases addressesOfKey() collects, plus the communities whose
+ * record claims one of them (claimsOfKey()). Returns how many moved up.
+ */
+export function requeueCandidatesOf(addresses: string[], now: number): number {
+  return getDb()
+    .prepare(
+      `WITH listed(address) AS (SELECT value FROM json_each(@addresses)),
+         -- The addresses themselves, plus the key of every community known by one of them or claiming one.
+         keyed(address) AS (
+           SELECT address FROM listed
+           UNION SELECT public_key FROM candidates
+             WHERE address IN (SELECT address FROM listed) AND public_key IS NOT NULL
+           UNION SELECT public_key FROM communities
+             WHERE address IN (SELECT address FROM listed) OR name IN (SELECT address FROM listed)
+               OR claimed_name IN (SELECT address FROM listed))
+       UPDATE candidates SET next_check_at = @now
+         WHERE next_check_at > @now
+           AND (address IN (SELECT address FROM keyed) OR public_key IN (SELECT address FROM keyed))`,
+    )
+    .run({ addresses: JSON.stringify(addresses), now }).changes;
+}
+
 /** Every candidate address that resolved to each public key. */
 export function aliasesByKey(): Map<string, string[]> {
   const out = new Map<string, string[]>();

@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 import { communityViews } from './api/view.js';
 import { config } from './config.js';
@@ -12,7 +15,7 @@ import {
   sourcesByAddress,
 } from './db/index.js';
 import { backoffSeconds, refreshSources, setDepsForTest, SUBMISSION_GIVE_UP_FAILURES, tick } from './discover.js';
-import { parseOverrides, setOverrides } from './overrides.js';
+import { parseOverrides, pollOverrides, setOverrides, startOverrides, stopOverrides } from './overrides.js';
 import { setPkcClientForTest, type PkcClient } from './pkc/client.js';
 import { nowSec } from './util.js';
 
@@ -415,4 +418,93 @@ test('the end-of-tick client recycle leaves alone a client a source refresh is s
     setPkcClientForTest(null);
   }
   assert.deepEqual(sourcesOf('chained.bso'), ['author-chain:indexed.bso']);
+});
+
+test('lifting a block makes the community due again at once', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'discovery-unblock-'));
+  const file = join(dir, 'overrides.json');
+  const writeOverrides = async (entries: unknown[], mtimeSec: number) => {
+    await writeFile(file, JSON.stringify(entries));
+    await utimes(file, mtimeSec, mtimeSec);
+    await pollOverrides(file);
+  };
+  const calls = fakePkc({
+    'bad.bso': { name: 'bad.bso', publicKey: KEY_A },
+    // Its record claims a name that never resolves to it.
+    [KEY_B]: { name: 'claimed.bso', publicKey: KEY_B },
+  });
+  const fetchesOf = (address: string) => calls.communities.filter((a) => a === address).length;
+  const blocked = ['bad.bso', KEY_B];
+  try {
+    addCandidate('bad.bso', 'seed', 'SEEDS', nowSec());
+    addCandidate(KEY_B, 'ens', '0xnode', nowSec());
+    await tick();
+    assert.deepEqual(blocked.map(fetchesOf), [1, 1]);
+
+    // Blocked by its key, and by the name it claims: the next check is pushed back by RETRY_MAX_MS.
+    await writeOverrides([{ address: KEY_A, status: 'blocked' }, { address: 'claimed.bso', status: 'blocked' }], 1_000_000);
+    blocked.forEach(makeDue);
+    await tick();
+    assert.deepEqual(blocked.map(fetchesOf), [1, 1]);
+    for (const address of blocked) assert.ok(getCandidate(address)!.next_check_at > nowSec() + 24 * 3600);
+
+    await writeOverrides([], 2_000_000);
+    for (const address of blocked) {
+      assert.ok(getCandidate(address)!.next_check_at <= nowSec(), `${address} is due again once the block is lifted`);
+    }
+    await tick();
+    assert.deepEqual(blocked.map(fetchesOf), [2, 2]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a block lifted while the service was down makes the community due when it starts again', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'discovery-unblock-'));
+  const file = join(dir, 'overrides.json');
+  const calls = fakePkc({ 'bad.bso': { name: 'bad.bso', publicKey: KEY_A }, 'worse.bso': { name: 'worse.bso', publicKey: KEY_B } });
+  const fetchesOf = (address: string) => calls.communities.filter((a) => a === address).length;
+  const deferred = (address: string) => getCandidate(address)!.next_check_at > nowSec() + 24 * 3600;
+  // A restart: the verdicts in memory are gone, the database is not.
+  const restart = async (source: string) => {
+    stopOverrides();
+    setOverrides(new Map());
+    mutableConfig.overridesSource = source;
+    await startOverrides();
+  };
+  try {
+    await writeFile(file, JSON.stringify([{ address: 'bad.bso', status: 'blocked' }, { address: KEY_B, status: 'blocked' }]));
+    await restart(file);
+    addCandidate('bad.bso', 'seed', 'SEEDS', nowSec());
+    addCandidate('worse.bso', 'seed', 'SEEDS', nowSec());
+    await tick();
+    // worse.bso is blocked by its key, which is only known once it has been fetched.
+    assert.deepEqual(['bad.bso', 'worse.bso'].map(fetchesOf), [0, 1]);
+    makeDue('worse.bso');
+    await tick();
+    assert.ok(deferred('bad.bso') && deferred('worse.bso'));
+
+    // A start that cannot load the file refuses to run and changes nothing.
+    await rm(file);
+    await assert.rejects(restart(file), /could not be loaded/);
+    assert.ok(deferred('bad.bso') && deferred('worse.bso'));
+
+    // bad.bso's block is lifted while the service is down.
+    await writeFile(file, JSON.stringify([{ address: KEY_B, status: 'blocked' }]));
+    await restart(file);
+    assert.ok(!deferred('bad.bso'), 'bad.bso is due at once');
+    assert.ok(deferred('worse.bso'), 'worse.bso is still blocked');
+    await tick();
+    assert.deepEqual(['bad.bso', 'worse.bso'].map(fetchesOf), [1, 1]);
+
+    // Started without OVERRIDES_SOURCE: the blocks the last run applied are lifted too.
+    await restart('');
+    assert.ok(!deferred('worse.bso'), 'worse.bso is due at once');
+    await tick();
+    assert.deepEqual(['bad.bso', 'worse.bso'].map(fetchesOf), [1, 2]);
+  } finally {
+    stopOverrides();
+    mutableConfig.overridesSource = '';
+    await rm(dir, { recursive: true, force: true });
+  }
 });

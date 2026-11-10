@@ -259,6 +259,32 @@ export function allCandidates(): CandidateRow[] {
   return getDb().prepare('SELECT * FROM candidates ORDER BY first_seen_at DESC, address').all() as CandidateRow[];
 }
 
+/**
+ * Every address one community is known by: its key, the address and name
+ * stored for it, and every candidate that resolved to it. The same set the API
+ * matches review verdicts against, so a check sees the verdict the list shows.
+ */
+export function addressesOfKey(publicKey: string): string[] {
+  const database = getDb();
+  const out = new Set([publicKey]);
+  const community = database.prepare('SELECT address, name FROM communities WHERE public_key = ?').get(publicKey) as
+    | { address: string; name: string | null }
+    | undefined;
+  if (community) out.add(community.address);
+  if (community?.name) out.add(community.name);
+  const aliases = database.prepare('SELECT address FROM candidates WHERE public_key = ?').all(publicKey) as { address: string }[];
+  for (const { address } of aliases) out.add(address);
+  return [...out];
+}
+
+/** The name a community's record claims that is not verified to resolve to it, in overrideFor()'s `claims` form. */
+export function claimsOfKey(publicKey: string): string[] {
+  const row = getDb().prepare('SELECT claimed_name FROM communities WHERE public_key = ?').get(publicKey) as
+    | { claimed_name: string | null }
+    | undefined;
+  return row?.claimed_name ? [row.claimed_name] : [];
+}
+
 /** Every candidate address that resolved to each public key. */
 export function aliasesByKey(): Map<string, string[]> {
   const out = new Map<string, string[]>();

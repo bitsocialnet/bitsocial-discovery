@@ -16,6 +16,8 @@ import { isAddress, normalizeAddress } from './address.js';
 import { config, hasConfiguredSources } from './config.js';
 import {
   addCandidate,
+  addressesOfKey,
+  claimsOfKey,
   deferCandidate,
   dropUnresolvedSubmission,
   dueCandidates,
@@ -175,8 +177,11 @@ function isVerifiedName(claimed: string, address: string, publicKey: string, nam
 export async function checkCandidate(row: CandidateRow): Promise<void> {
   const { address } = row;
   const now = nowSec();
-  const known = [address, ...(row.public_key ? [row.public_key] : [])];
-  if (overrideFor(known).status === 'blocked') {
+  // Every address the community is known by, and a name it claims, as the API matches them: a
+  // block on its name must stop the fetch under its key too, and the other way round.
+  const key = row.public_key ?? address;
+  const known = [address, ...addressesOfKey(key)];
+  if (overrideFor(known, claimsOfKey(key)).status === 'blocked') {
     deferCandidate(address, now + Math.ceil(config.retryMaxMs / 1000));
     return;
   }
@@ -226,7 +231,7 @@ export async function checkCandidate(row: CandidateRow): Promise<void> {
   if (isNew) console.log(`[discover] resolved ${address}${name && name !== address ? ` (${name})` : ''}`);
 
   const claims = unverified ? [unverified] : [];
-  if (overrideFor([...known, publicKey, ...(name ? [name] : [])], claims).status === 'blocked') return;
+  if (overrideFor([...known, ...addressesOfKey(publicKey)], claims).status === 'blocked') return;
   const harvest = harvestCommunity(community);
   // An unverified name is checked on its own; once it resolves to this key, it is the address.
   if (unverified && isAddress(unverified)) harvest.mentions.add(unverified);

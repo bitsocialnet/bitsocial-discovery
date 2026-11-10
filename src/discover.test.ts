@@ -261,6 +261,35 @@ test('a block or hide on a name a record claims applies before the name is verif
   assert.deepEqual(communityViews(false), [], 'neither is listed publicly');
   assert.equal(getCandidate('leak.bso'), undefined, 'a blocked community is not harvested');
   assert.deepEqual(sourcesOf('next.bso'), [`mention:${KEY_D}`], 'a hidden one still is');
+
+  // Not fetched again under its key, although the name it claims never resolved.
+  makeDue(KEY_C);
+  await tick();
+  assert.equal(calls.communities.filter((a) => a === KEY_C).length, 1, 'not fetched again under its key');
+  assert.ok(getCandidate(KEY_C)!.next_check_at > nowSec() + 24 * 3600);
+});
+
+test('a block on any address of a known community stops it being fetched under its other addresses', async () => {
+  // A list entry that names a community by name and key makes two candidates for one community.
+  const spam = { name: 'spam.bso', publicKey: KEY_C, description: 'see leak.bso' };
+  const other = { name: 'other.bso', publicKey: KEY_D };
+  const calls = fakePkc({ 'spam.bso': spam, [KEY_C]: spam, 'other.bso': other, [KEY_D]: other });
+  addCandidate('spam.bso', 'seed', 'list.json', nowSec());
+  addCandidate(KEY_C, 'seed', 'list.json', nowSec());
+  addCandidate('other.bso', 'seed', 'list.json', nowSec());
+  const fetchesOf = (...addresses: string[]) => calls.communities.filter((a) => addresses.includes(a)).length;
+  await tick();
+  assert.equal(fetchesOf('spam.bso', KEY_C, 'other.bso'), 3);
+
+  setOverrides(parseOverrides([{ address: 'spam.bso', status: 'blocked' }, { address: 'other.bso', status: 'blocked' }]));
+  makeDue('spam.bso');
+  makeDue(KEY_C);
+  // A crosspost names other.bso's community by its key after the block.
+  addCandidate(KEY_D, 'crosspost', 'elsewhere.bso', nowSec());
+  await tick();
+  assert.equal(fetchesOf('spam.bso', KEY_C, 'other.bso', KEY_D), 3, 'no address of either is fetched again');
+  assert.ok(getCandidate(KEY_C)!.next_check_at > nowSec() + 24 * 3600);
+  assert.ok(getCandidate(KEY_D)!.next_check_at > nowSec() + 24 * 3600);
 });
 
 test('refreshSources reads indexer communities and credits comment pointers to their community', async () => {

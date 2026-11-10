@@ -21,8 +21,9 @@
  *
  * `nsfw` overrides the community's own `features.safeForWork`. `reason` is an
  * operator note and is only shown to admin requests. The file is re-read
- * whenever its mtime changes (polled every 30s); a broken file keeps the
- * previous verdicts.
+ * whenever its mtime changes (polled every 30s); a broken or unreadable file
+ * keeps the previous verdicts, a deleted one clears them, and one that cannot
+ * be loaded at startup stops the service from starting.
  */
 import { readFile, stat } from 'node:fs/promises';
 import { normalizeAddress } from './address.js';
@@ -112,7 +113,7 @@ export function overrideFor(addresses: Iterable<string>, claims: Iterable<string
   };
 }
 
-let lastMtimeMs: number | null = null; // null = never checked, -1 = file absent
+let lastMtimeMs: number | null = null; // null = never loaded, -1 = file absent
 let timer: NodeJS.Timeout | undefined;
 
 /** Check the file's mtime and (re)apply it when it changed. Exported for tests. */
@@ -121,7 +122,13 @@ export async function pollOverrides(source = config.overridesSource): Promise<vo
   let mtimeMs: number;
   try {
     mtimeMs = (await stat(source)).mtimeMs;
-  } catch {
+  } catch (err) {
+    // Only a deleted file withdraws the verdicts. Any other failure (permissions, too many open
+    // files) says nothing about what the operator decided, so the current verdicts stay.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.error(`[overrides] cannot read ${source}: ${errorMessage(err)}`);
+      return;
+    }
     if (lastMtimeMs !== -1) {
       if (lastMtimeMs !== null) console.log(`[overrides] ${source} is gone — overrides cleared`);
       lastMtimeMs = -1;
@@ -140,9 +147,19 @@ export async function pollOverrides(source = config.overridesSource): Promise<vo
   }
 }
 
+/**
+ * Load OVERRIDES_SOURCE before anything is served or fetched. A configured
+ * file that cannot be loaded is fatal: running without it would list hidden
+ * communities and fetch blocked ones until someone read the log.
+ */
 export async function startOverrides(): Promise<void> {
-  if (!config.overridesSource) return;
-  await pollOverrides();
+  const source = config.overridesSource;
+  if (!source) return;
+  lastMtimeMs = null;
+  await pollOverrides(source);
+  if (lastMtimeMs === null || lastMtimeMs === -1) {
+    throw new Error(`OVERRIDES_SOURCE ${source} could not be loaded; not starting without the review file`);
+  }
   timer = setInterval(() => void pollOverrides(), POLL_MS);
   timer.unref();
 }

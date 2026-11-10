@@ -161,7 +161,10 @@ still blocks whatever claims it.
 
 When aliases of one community disagree, the strictest status wins. `nsfw`
 overrides the owner's `features.safeForWork`. `reason` is only returned to
-admin requests. The file is re-read whenever it changes.
+admin requests. The file is re-read whenever it changes. If it is set but
+cannot be read or parsed at startup, the service exits instead of running
+without it; later, a broken or unreadable file keeps the previous verdicts
+and a deleted one clears them.
 
 ## API
 

@@ -1,9 +1,17 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { overrideFor, parseOverrides, pollOverrides, setOverrides } from './overrides.js';
+import { config } from './config.js';
+import {
+  overrideFor,
+  parseOverrides,
+  pollOverrides,
+  setOverrides,
+  startOverrides,
+  stopOverrides,
+} from './overrides.js';
 
 test('parseOverrides keeps valid entries and skips the rest', () => {
   const parsed = parseOverrides([
@@ -77,3 +85,54 @@ test('pollOverrides applies the file, reloads it on change and clears it when de
     setOverrides(new Map());
   }
 });
+
+test('startOverrides refuses to start when the configured review file cannot be loaded', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'discovery-overrides-'));
+  const file = join(dir, 'overrides.json');
+  const mutableConfig = config as unknown as Record<string, unknown>;
+  mutableConfig.overridesSource = file;
+  try {
+    await assert.rejects(startOverrides(), /could not be loaded/, 'a missing file');
+    await writeFile(file, 'not json');
+    await assert.rejects(startOverrides(), /could not be loaded/, 'a broken file');
+
+    await writeFile(file, JSON.stringify([{ address: 'x.bso', status: 'blocked' }]));
+    await startOverrides();
+    assert.equal(overrideFor(['x.bso']).status, 'blocked');
+  } finally {
+    stopOverrides();
+    mutableConfig.overridesSource = '';
+    await rm(dir, { recursive: true, force: true });
+    setOverrides(new Map());
+  }
+});
+
+test(
+  'pollOverrides keeps the verdicts while the file cannot be read and clears them only once it is gone',
+  { skip: process.getuid?.() === 0 ? 'root reads files whatever their permissions' : false },
+  async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'discovery-overrides-'));
+    const mount = join(dir, 'config');
+    const file = join(mount, 'overrides.json');
+    try {
+      await mkdir(mount);
+      await writeFile(file, JSON.stringify([{ address: 'x.bso', status: 'blocked' }]));
+      await utimes(file, 3_000_000, 3_000_000);
+      await pollOverrides(file);
+      assert.equal(overrideFor(['x.bso']).status, 'blocked');
+
+      await chmod(mount, 0o000);
+      await pollOverrides(file);
+      assert.equal(overrideFor(['x.bso']).status, 'blocked', 'an unreadable file keeps the previous verdicts');
+
+      await chmod(mount, 0o700);
+      await rm(file);
+      await pollOverrides(file);
+      assert.deepEqual(overrideFor(['x.bso']), {});
+    } finally {
+      await chmod(mount, 0o700).catch(() => {});
+      await rm(dir, { recursive: true, force: true });
+      setOverrides(new Map());
+    }
+  },
+);

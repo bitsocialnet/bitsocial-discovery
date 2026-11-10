@@ -13,7 +13,7 @@ import {
 } from './db/index.js';
 import { backoffSeconds, refreshSources, setDepsForTest, SUBMISSION_GIVE_UP_FAILURES, tick } from './discover.js';
 import { parseOverrides, setOverrides } from './overrides.js';
-import type { PkcClient } from './pkc/client.js';
+import { setPkcClientForTest, type PkcClient } from './pkc/client.js';
 import { nowSec } from './util.js';
 
 const KEY_A = '12D3KooWNv5HzmkcKZkxMn1SrfMyozTdTJSr7kA1bzEKKa7PTS5N';
@@ -323,4 +323,96 @@ test('refreshSources reads indexer communities and credits comment pointers to t
   assert.deepEqual(sourcesOf('indexed.bso'), ['indexer:https://idx.example']);
   assert.deepEqual(sourcesOf('elsewhere.bso'), ['mention:indexed.bso']);
   assert.deepEqual(sourcesOf('origin.bso'), ['crosspost:indexed.bso']);
+});
+
+test('a chain hop cut short by its check deadline leaves alone a client another check is still using', async () => {
+  const pending = new Set<(err: Error) => void>();
+  // Settles after `ms`, unless the client is destroyed first.
+  const later = (ms: number, value: unknown) =>
+    new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(fail);
+        resolve(value);
+      }, ms);
+      const fail = (err: Error) => {
+        clearTimeout(timer);
+        reject(err);
+      };
+      pending.add(fail);
+    });
+  const withChain = { raw: { comment: { author: { previousCommentCid: CID_1 } } } };
+  const communities: Record<string, [number, unknown]> = {
+    'a.bso': [0, { name: 'a.bso', publicKey: KEY_A, posts: { pages: { hot: { comments: [withChain] } } } }],
+    'b.bso': [200, { name: 'b.bso', publicKey: KEY_B }],
+    'c.bso': [300, { name: 'c.bso', publicKey: KEY_C }],
+  };
+  const client: PkcClient = {
+    getCommunity: (address) => later(...communities[address]!),
+    // No node serves the comment: the hop runs until a.bso's check deadline.
+    getComment: () => later(60_000, {}),
+    destroy: async () => {
+      for (const fail of pending) fail(new Error('client destroyed'));
+      pending.clear();
+    },
+  };
+  // The real getPkcClient serves this client, so a reset reaches it as it would in production.
+  setDepsForTest(null);
+  setPkcClientForTest(Promise.resolve(client));
+  const savedTimeout = config.checkTimeoutMs;
+  mutableConfig.checkTimeoutMs = 400;
+  try {
+    for (const address of Object.keys(communities)) addCandidate(address, 'seed', 'SEEDS', nowSec());
+    // Two workers: a.bso's hop runs out at 400 ms, while c.bso's check (200 to 500 ms) is still waiting.
+    assert.equal(await tick(), 3);
+  } finally {
+    mutableConfig.checkTimeoutMs = savedTimeout;
+    setPkcClientForTest(null);
+  }
+  const c = getCandidate('c.bso')!;
+  assert.deepEqual({ failures: c.failures, error: c.last_error, key: c.public_key }, { failures: 0, error: null, key: KEY_C });
+  assert.equal(getCandidate('a.bso')!.failures, 0);
+});
+
+test('the end-of-tick client recycle leaves alone a client a source refresh is still using', async () => {
+  let destroyed = 0;
+  let commentAsked!: () => void;
+  const asked = new Promise<void>((resolve) => (commentAsked = resolve));
+  let answerComment!: (comment: unknown) => void;
+  const client: PkcClient = {
+    getCommunity: async () => ({ name: 'a.bso', publicKey: KEY_A }),
+    getComment: () => {
+      commentAsked();
+      return new Promise((resolve) => (answerComment = resolve));
+    },
+    destroy: async () => {
+      destroyed++;
+    },
+  };
+  // The real getPkcClient serves this client, so tick() recycles it as it would in production.
+  setDepsForTest(null);
+  setPkcClientForTest(Promise.resolve(client));
+  mutableConfig.indexerUrls = ['https://idx.example'];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    if (String(input).endsWith('/api/communities')) return new Response(JSON.stringify({ communities: [] }));
+    const raw = JSON.stringify({ comment: { author: { previousCommentCid: CID_1 } } });
+    return new Response(
+      JSON.stringify({
+        posts: [{ cid: CID_2, community_address: 'indexed.bso', timestamp: nowSec() - 10, raw }],
+      }),
+    );
+  }) as typeof fetch;
+  const refresh = refreshSources();
+  try {
+    await asked;
+    addCandidate('a.bso', 'seed', 'SEEDS', nowSec());
+    assert.equal(await tick(), 1);
+    assert.equal(destroyed, 0, 'the client the refresh is waiting on is not destroyed under it');
+  } finally {
+    answerComment?.({ communityAddress: 'chained.bso' });
+    await refresh;
+    globalThis.fetch = realFetch;
+    setPkcClientForTest(null);
+  }
+  assert.deepEqual(sourcesOf('chained.bso'), ['author-chain:indexed.bso']);
 });

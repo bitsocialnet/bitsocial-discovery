@@ -91,6 +91,12 @@ export function backoffSeconds(failures: number): number {
  * once ever (cached in followed_comments); a hop that fails is retried on the
  * next check. Stops early at `deadline` so a long chain cannot outlive its
  * check's timeout.
+ *
+ * A hop that runs out of time does not reset the PKC client: its timeout is
+ * only what is left of the shared deadline, and a comment no node serves any
+ * more hangs just the same, so it says nothing about the client. Resetting
+ * would destroy every other check's call on it. A hung client is caught by a
+ * check's own full-length getCommunity timeout.
  */
 export async function followChains(starts: Iterable<string>, via: string, deadline: number): Promise<number> {
   if (config.authorChainDepth === 0) return 0;
@@ -109,8 +115,7 @@ export async function followChains(starts: Iterable<string>, via: string, deadli
         try {
           const pkc = await deps.pkc();
           comment = await withTimeout(pkc.getComment(cid), Math.max(1, deadline - Date.now()), `comment ${cid}`);
-        } catch (err) {
-          if (err instanceof TimeoutError) void resetPkcClient();
+        } catch {
           break;
         }
         const signed = comment?.raw?.comment ?? comment;
@@ -188,11 +193,13 @@ export async function checkCandidate(row: CandidateRow): Promise<void> {
 
   const deadline = Date.now() + config.checkTimeoutMs;
   let community: any;
+  let pkc: PkcClient | undefined;
   try {
-    const pkc = await deps.pkc();
+    pkc = await deps.pkc();
     community = await withTimeout(pkc.getCommunity(address), config.checkTimeoutMs, `community ${address}`);
   } catch (err) {
-    if (err instanceof TimeoutError) void resetPkcClient();
+    // Only the client this call used: another worker may already be on its replacement.
+    if (err instanceof TimeoutError) void resetPkcClient({ client: pkc });
     const failures = markFailed(address, errorMessage(err), now, now + backoffSeconds((row.failures ?? 0) + 1));
     if (failures === 1) console.log(`[discover] ${address}: ${errorMessage(err)}`);
     if (failures >= SUBMISSION_GIVE_UP_FAILURES && dropUnresolvedSubmission(address)) {
@@ -320,7 +327,8 @@ let ticking = false;
 /**
  * pkc-js keeps every community and comment it loaded until the client is
  * destroyed (see bitsocial-indexer's crawler), so a tick that used the client
- * retires it and the next one reconnects.
+ * retires it and the next one reconnects. Not while refreshSources is walking
+ * author chains on the same client: a later tick recycles it instead.
  */
 async function recyclePkcClient(): Promise<void> {
   try {
@@ -348,7 +356,7 @@ export async function tick(): Promise<number> {
       }
     });
   } finally {
-    if (checked && deps.pkc === defaultDeps.pkc) await recyclePkcClient();
+    if (checked && deps.pkc === defaultDeps.pkc && !refreshing) await recyclePkcClient();
     ticking = false;
   }
   return checked;

@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS communities (
   safe_for_work     INTEGER,           -- features.safeForWork: 1, 0, or NULL when unset
   ui_type           TEXT,              -- suggested.uiType ("author" = a profile)
   first_seen_at     INTEGER NOT NULL,  -- first successful check
-  last_resolved_at  INTEGER NOT NULL
+  last_resolved_at  INTEGER NOT NULL,
+  claimed_name      TEXT               -- a name the record claims that is not verified to resolve to it
 );
 
 -- How each address was found. `via` is the source URL, the ENS node, or the
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS followed_comments (
 );
 
 -- Cursors: the ENS block reached, the newest comment read from each indexer.
+-- Also the addresses the review file blocked when it was last applied.
 CREATE TABLE IF NOT EXISTS state (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL

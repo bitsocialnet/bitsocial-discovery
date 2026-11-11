@@ -38,6 +38,8 @@ export interface CommunityRow {
   ui_type: string | null;
   first_seen_at: number;
   last_resolved_at: number;
+  /** A name the record claims that is not verified to resolve to it: only a block or hide on it applies. */
+  claimed_name: string | null;
 }
 
 export interface SourceRow {
@@ -57,7 +59,44 @@ export function getDb(): Database.Database {
   db.pragma('busy_timeout = 5000');
   const here = dirname(fileURLToPath(import.meta.url));
   db.exec(readFileSync(join(here, 'schema.sql'), 'utf8'));
+  migrate(db);
   return db;
+}
+
+/**
+ * Add the columns schema.sql gained since a database was created: its
+ * CREATE TABLE IF NOT EXISTS leaves an existing table as it is.
+ *
+ * Versions without communities.claimed_name stored whatever name a record
+ * claimed as its address, and a row is only rewritten by a check that
+ * succeeds, so a community that stays offline would keep a name it may not
+ * own, and that name's verdict, for good. When the column is added, a name
+ * no candidate resolved to the same key moves to it, and the community's
+ * candidates are due at once so a name it does own is soon verified again.
+ * Only then: later rows hold names pkc-js verified without a candidate.
+ */
+function migrate(database: Database.Database): void {
+  const columns = database.prepare('PRAGMA table_info(communities)').all() as { name: string }[];
+  if (columns.some((c) => c.name === 'claimed_name')) return;
+  const demoted = database.transaction((): number => {
+    database.exec('ALTER TABLE communities ADD COLUMN claimed_name TEXT');
+    const changes = database
+      .prepare(
+        `UPDATE communities SET claimed_name = name, name = NULL, address = public_key
+           WHERE name IS NOT NULL AND NOT EXISTS (
+             SELECT 1 FROM candidates WHERE candidates.address = communities.name
+               AND candidates.public_key = communities.public_key)`,
+      )
+      .run().changes;
+    database
+      .prepare(
+        `UPDATE candidates SET next_check_at = @now WHERE next_check_at > @now
+           AND public_key IN (SELECT public_key FROM communities WHERE claimed_name IS NOT NULL)`,
+      )
+      .run({ now: Math.floor(Date.now() / 1000) });
+    return changes;
+  })();
+  if (demoted) console.log(`[db] ${demoted} unverified community names moved from address to claimed_name`);
 }
 
 /** Drop the connection so the next getDb() starts from an empty in-memory database. Tests only. */
@@ -169,21 +208,23 @@ export function deferCandidate(address: string, nextCheckAt: number): void {
   getDb().prepare('UPDATE candidates SET next_check_at = ? WHERE address = ?').run(nextCheckAt, address);
 }
 
-export function upsertCommunity(row: Omit<CommunityRow, 'first_seen_at'>): void {
+export function upsertCommunity(
+  row: Omit<CommunityRow, 'first_seen_at' | 'claimed_name'> & { claimed_name?: string | null },
+): void {
   getDb()
     .prepare(
       `INSERT INTO communities (public_key, address, name, title, description, created_at, updated_at,
-         pseudonymity_mode, safe_for_work, ui_type, first_seen_at, last_resolved_at)
+         pseudonymity_mode, safe_for_work, ui_type, first_seen_at, last_resolved_at, claimed_name)
        VALUES (@public_key, @address, @name, @title, @description, @created_at, @updated_at,
-         @pseudonymity_mode, @safe_for_work, @ui_type, @last_resolved_at, @last_resolved_at)
+         @pseudonymity_mode, @safe_for_work, @ui_type, @last_resolved_at, @last_resolved_at, @claimed_name)
        ON CONFLICT(public_key) DO UPDATE SET
          address = excluded.address, name = excluded.name, title = excluded.title,
          description = excluded.description, created_at = excluded.created_at,
          updated_at = excluded.updated_at, pseudonymity_mode = excluded.pseudonymity_mode,
          safe_for_work = excluded.safe_for_work, ui_type = excluded.ui_type,
-         last_resolved_at = excluded.last_resolved_at`,
+         last_resolved_at = excluded.last_resolved_at, claimed_name = excluded.claimed_name`,
     )
-    .run(row);
+    .run({ ...row, claimed_name: row.claimed_name ?? null });
 }
 
 export function hasCommunity(publicKey: string): boolean {
@@ -216,6 +257,57 @@ export function allCommunities(): CommunityRow[] {
 
 export function allCandidates(): CandidateRow[] {
   return getDb().prepare('SELECT * FROM candidates ORDER BY first_seen_at DESC, address').all() as CandidateRow[];
+}
+
+/**
+ * Every address one community is known by: its key, the address and name
+ * stored for it, and every candidate that resolved to it. The same set the API
+ * matches review verdicts against, so a check sees the verdict the list shows.
+ */
+export function addressesOfKey(publicKey: string): string[] {
+  const database = getDb();
+  const out = new Set([publicKey]);
+  const community = database.prepare('SELECT address, name FROM communities WHERE public_key = ?').get(publicKey) as
+    | { address: string; name: string | null }
+    | undefined;
+  if (community) out.add(community.address);
+  if (community?.name) out.add(community.name);
+  const aliases = database.prepare('SELECT address FROM candidates WHERE public_key = ?').all(publicKey) as { address: string }[];
+  for (const { address } of aliases) out.add(address);
+  return [...out];
+}
+
+/** The name a community's record claims that is not verified to resolve to it, in overrideFor()'s `claims` form. */
+export function claimsOfKey(publicKey: string): string[] {
+  const row = getDb().prepare('SELECT claimed_name FROM communities WHERE public_key = ?').get(publicKey) as
+    | { claimed_name: string | null }
+    | undefined;
+  return row?.claimed_name ? [row.claimed_name] : [];
+}
+
+/**
+ * Make every candidate of the communities known by any of `addresses` due
+ * now: the addresses themselves and every candidate sharing a key with one of
+ * them, the same aliases addressesOfKey() collects, plus the communities whose
+ * record claims one of them (claimsOfKey()). Returns how many moved up.
+ */
+export function requeueCandidatesOf(addresses: string[], now: number): number {
+  return getDb()
+    .prepare(
+      `WITH listed(address) AS (SELECT value FROM json_each(@addresses)),
+         -- The addresses themselves, plus the key of every community known by one of them or claiming one.
+         keyed(address) AS (
+           SELECT address FROM listed
+           UNION SELECT public_key FROM candidates
+             WHERE address IN (SELECT address FROM listed) AND public_key IS NOT NULL
+           UNION SELECT public_key FROM communities
+             WHERE address IN (SELECT address FROM listed) OR name IN (SELECT address FROM listed)
+               OR claimed_name IN (SELECT address FROM listed))
+       UPDATE candidates SET next_check_at = @now
+         WHERE next_check_at > @now
+           AND (address IN (SELECT address FROM keyed) OR public_key IN (SELECT address FROM keyed))`,
+    )
+    .run({ addresses: JSON.stringify(addresses), now }).changes;
 }
 
 /** Every candidate address that resolved to each public key. */

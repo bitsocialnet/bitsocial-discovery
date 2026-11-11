@@ -16,9 +16,12 @@ import { isAddress, normalizeAddress } from './address.js';
 import { config, hasConfiguredSources } from './config.js';
 import {
   addCandidate,
+  addressesOfKey,
+  claimsOfKey,
   deferCandidate,
   dropUnresolvedSubmission,
   dueCandidates,
+  getCandidate,
   getFollowedComment,
   getState,
   hasCommunity,
@@ -88,6 +91,12 @@ export function backoffSeconds(failures: number): number {
  * once ever (cached in followed_comments); a hop that fails is retried on the
  * next check. Stops early at `deadline` so a long chain cannot outlive its
  * check's timeout.
+ *
+ * A hop that runs out of time does not reset the PKC client: its timeout is
+ * only what is left of the shared deadline, and a comment no node serves any
+ * more hangs just the same, so it says nothing about the client. Resetting
+ * would destroy every other check's call on it. A hung client is caught by a
+ * check's own full-length getCommunity timeout.
  */
 export async function followChains(starts: Iterable<string>, via: string, deadline: number): Promise<number> {
   if (config.authorChainDepth === 0) return 0;
@@ -106,8 +115,7 @@ export async function followChains(starts: Iterable<string>, via: string, deadli
         try {
           const pkc = await deps.pkc();
           comment = await withTimeout(pkc.getComment(cid), Math.max(1, deadline - Date.now()), `comment ${cid}`);
-        } catch (err) {
-          if (err instanceof TimeoutError) void resetPkcClient();
+        } catch {
           break;
         }
         const signed = comment?.raw?.comment ?? comment;
@@ -151,25 +159,47 @@ function num(value: unknown): number | null {
 }
 
 /**
+ * Whether the name a community record claims is really its name. pkc-js
+ * answers getCommunity before it has checked the claim of a record loaded by
+ * key (`nameResolved` is still undefined then, and stays so when no resolver
+ * answers), so undefined is no verdict: the name is trusted only when pkc-js
+ * confirmed it, when this check loaded the community through that very name,
+ * or when discovery already resolved that name to this key. For a record
+ * loaded by name, `nameResolved` is pkc-js's verdict on that name, not on the
+ * claim.
+ */
+function isVerifiedName(claimed: string, address: string, publicKey: string, nameResolved: unknown): boolean {
+  if (nameResolved === false) return false;
+  if (claimed === address) return true;
+  if (nameResolved === true && !/\.(?:bso|eth)$/.test(address)) return true;
+  return getCandidate(claimed)?.public_key === publicKey;
+}
+
+/**
  * Fetch one candidate and record what it is. Blocked communities are never
  * fetched again once known, and are never harvested.
  */
 export async function checkCandidate(row: CandidateRow): Promise<void> {
   const { address } = row;
   const now = nowSec();
-  const known = [address, ...(row.public_key ? [row.public_key] : [])];
-  if (overrideFor(known).status === 'blocked') {
+  // Every address the community is known by, and a name it claims, as the API matches them: a
+  // block on its name must stop the fetch under its key too, and the other way round.
+  const key = row.public_key ?? address;
+  const known = [address, ...addressesOfKey(key)];
+  if (overrideFor(known, claimsOfKey(key)).status === 'blocked') {
     deferCandidate(address, now + Math.ceil(config.retryMaxMs / 1000));
     return;
   }
 
   const deadline = Date.now() + config.checkTimeoutMs;
   let community: any;
+  let pkc: PkcClient | undefined;
   try {
-    const pkc = await deps.pkc();
+    pkc = await deps.pkc();
     community = await withTimeout(pkc.getCommunity(address), config.checkTimeoutMs, `community ${address}`);
   } catch (err) {
-    if (err instanceof TimeoutError) void resetPkcClient();
+    // Only the client this call used: another worker may already be on its replacement.
+    if (err instanceof TimeoutError) void resetPkcClient({ client: pkc });
     const failures = markFailed(address, errorMessage(err), now, now + backoffSeconds((row.failures ?? 0) + 1));
     if (failures === 1) console.log(`[discover] ${address}: ${errorMessage(err)}`);
     if (failures >= SUBMISSION_GIVE_UP_FAILURES && dropUnresolvedSubmission(address)) {
@@ -184,13 +214,17 @@ export async function checkCandidate(row: CandidateRow): Promise<void> {
     markFailed(address, 'community has no public key', now, now + backoffSeconds((row.failures ?? 0) + 1));
     return;
   }
-  // A record can claim any name; only one that resolves back to this key is its address.
-  const name = community?.nameResolved === false ? null : str(community?.name);
+  // A record can claim any name; only one that resolves back to this key is its address. An
+  // unverified claim is kept aside: a block or hide on that name still applies, its approval does not.
+  const claimed = str(community?.name) ? normalizeAddress(community.name) : null;
+  const name = claimed && isVerifiedName(claimed, address, publicKey, community?.nameResolved) ? claimed : null;
+  const unverified = name ? null : claimed;
   const isNew = !hasCommunity(publicKey);
   upsertCommunity({
     public_key: publicKey,
-    address: name ? normalizeAddress(name) : publicKey,
-    name: name ? normalizeAddress(name) : null,
+    address: name ?? publicKey,
+    name,
+    claimed_name: unverified,
     title: str(community?.title),
     description: str(community?.description),
     created_at: num(community?.createdAt),
@@ -203,8 +237,12 @@ export async function checkCandidate(row: CandidateRow): Promise<void> {
   markResolved(address, publicKey, now, now + Math.ceil(config.recheckIntervalMs / 1000));
   if (isNew) console.log(`[discover] resolved ${address}${name && name !== address ? ` (${name})` : ''}`);
 
-  if (overrideFor([...known, publicKey, ...(name ? [name] : [])]).status === 'blocked') return;
-  const added = await expand(harvestCommunity(community), name ?? publicKey, deadline);
+  const claims = unverified ? [unverified] : [];
+  if (overrideFor([...known, ...addressesOfKey(publicKey)], claims).status === 'blocked') return;
+  const harvest = harvestCommunity(community);
+  // An unverified name is checked on its own; once it resolves to this key, it is the address.
+  if (unverified && isAddress(unverified)) harvest.mentions.add(unverified);
+  const added = await expand(harvest, name ?? publicKey, deadline);
   if (added) console.log(`[discover] ${name ?? address}: ${added} new candidates`);
 }
 
@@ -289,7 +327,8 @@ let ticking = false;
 /**
  * pkc-js keeps every community and comment it loaded until the client is
  * destroyed (see bitsocial-indexer's crawler), so a tick that used the client
- * retires it and the next one reconnects.
+ * retires it and the next one reconnects. Not while refreshSources is walking
+ * author chains on the same client: a later tick recycles it instead.
  */
 async function recyclePkcClient(): Promise<void> {
   try {
@@ -317,7 +356,7 @@ export async function tick(): Promise<number> {
       }
     });
   } finally {
-    if (checked && deps.pkc === defaultDeps.pkc) await recyclePkcClient();
+    if (checked && deps.pkc === defaultDeps.pkc && !refreshing) await recyclePkcClient();
     ticking = false;
   }
   return checked;

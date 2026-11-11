@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
+import { communityViews } from './api/view.js';
 import { config } from './config.js';
 import {
   addCandidate,
@@ -11,13 +15,14 @@ import {
   sourcesByAddress,
 } from './db/index.js';
 import { backoffSeconds, refreshSources, setDepsForTest, SUBMISSION_GIVE_UP_FAILURES, tick } from './discover.js';
-import { parseOverrides, setOverrides } from './overrides.js';
-import type { PkcClient } from './pkc/client.js';
+import { parseOverrides, pollOverrides, setOverrides, startOverrides, stopOverrides } from './overrides.js';
+import { setPkcClientForTest, type PkcClient } from './pkc/client.js';
 import { nowSec } from './util.js';
 
 const KEY_A = '12D3KooWNv5HzmkcKZkxMn1SrfMyozTdTJSr7kA1bzEKKa7PTS5N';
 const KEY_B = '12D3KooWFkZorC92RxQAwMBYMido8xBM88ghpLWA26mrE9W9Xmxd';
 const KEY_C = '12D3KooWFL5oGc9p9CYs25eeK5cCpPXXhibECsnqmuxinq2jbtjP';
+const KEY_D = '12D3KooWCqU7kP2fJwaDrV8mQ3gKxbEsW9nR4hLycFtXAoS5iMzd';
 const CID_1 = 'QmULtQscGrFmc4qcZDbsZMFxyJT1qT3qQVZ28Vc1YhbwLq';
 const CID_2 = 'QmemhNu7rQum2TCKHJn1h7UqUmtRV1jtcdLXNfoXCt7nn5';
 
@@ -189,6 +194,107 @@ test('a name the record claims but does not resolve to its key is not used as th
   assert.deepEqual({ ...row }, { address: KEY_B, name: null });
 });
 
+function storedAddress(publicKey: string): { address: string; name: string | null } | undefined {
+  const row = getDb().prepare('SELECT address, name FROM communities WHERE public_key = ?').get(publicKey);
+  return row ? { ...(row as { address: string; name: string | null }) } : undefined;
+}
+
+test('a name a key-loaded record claims becomes its address only once it is verified', async () => {
+  setOverrides(parseOverrides([{ address: 'memes.bso', status: 'approved' }]));
+  // pkc-js answers before it has checked a key-loaded record's name, so nameResolved is
+  // usually still undefined: the claim is unverified.
+  fakePkc({
+    'memes.bso': { name: 'memes.bso', publicKey: KEY_A, title: 'Memes' },
+    [KEY_B]: { name: 'memes.bso', publicKey: KEY_B, title: 'Not memes' },
+    [KEY_C]: { name: 'real.bso', publicKey: KEY_C, title: 'Real' },
+    'real.bso': { name: 'real.bso', publicKey: KEY_C, title: 'Real' },
+    [KEY_D]: { name: 'checked.bso', nameResolved: true, publicKey: KEY_D },
+  });
+  addCandidate('memes.bso', 'seed', 'SEEDS', nowSec());
+  addCandidate(KEY_B, 'submission', 'api', nowSec());
+  addCandidate(KEY_C, 'ens', '0xnode', nowSec());
+  addCandidate(KEY_D, 'ens', '0xnode', nowSec());
+  await tick();
+
+  // Another key claiming memes.bso is listed under its own key, without memes.bso's verdict.
+  assert.deepEqual(storedAddress(KEY_B), { address: KEY_B, name: null });
+  assert.deepEqual(storedAddress(KEY_A), { address: 'memes.bso', name: 'memes.bso' });
+  const reviews = Object.fromEntries(communityViews(true).map((c) => [c.publicKey, c.review]));
+  assert.equal(reviews[KEY_A], 'approved');
+  assert.equal(reviews[KEY_B], 'unreviewed');
+  // A name pkc-js has verified is used at once.
+  assert.deepEqual(storedAddress(KEY_D), { address: 'checked.bso', name: 'checked.bso' });
+
+  // An unverified name is checked on its own, and once it resolves to the key it is the address.
+  assert.deepEqual(storedAddress(KEY_C), { address: KEY_C, name: null });
+  assert.deepEqual(sourcesOf('real.bso'), [`mention:${KEY_C}`]);
+  await tick();
+  assert.deepEqual(storedAddress(KEY_C), { address: 'real.bso', name: 'real.bso' });
+  makeDue(KEY_C);
+  await tick();
+  assert.deepEqual(storedAddress(KEY_C), { address: 'real.bso', name: 'real.bso' });
+});
+
+test('a block or hide on a name a record claims applies before the name is verified', async () => {
+  setOverrides(
+    parseOverrides([
+      { address: 'spam.bso', status: 'blocked', reason: 'report' },
+      { address: 'quiet.bso', status: 'hidden', nsfw: true },
+    ]),
+  );
+  // A list entry naming a community by name and key: the blocked name is never fetched, so the
+  // key's claim to it can never be verified.
+  const calls = fakePkc({
+    [KEY_C]: { name: 'spam.bso', publicKey: KEY_C, description: 'see leak.bso' },
+    [KEY_D]: { name: 'quiet.bso', publicKey: KEY_D, description: 'see next.bso' },
+  });
+  addCandidate('spam.bso', 'seed', 'list.json', nowSec());
+  addCandidate(KEY_C, 'seed', 'list.json', nowSec());
+  addCandidate(KEY_D, 'ens', '0xnode', nowSec());
+  await tick();
+  assert.deepEqual([...calls.communities].sort(), [KEY_C, KEY_D].sort());
+
+  // Neither takes the claimed name as its address, but both keep its restriction.
+  assert.deepEqual(storedAddress(KEY_C), { address: KEY_C, name: null });
+  assert.deepEqual(storedAddress(KEY_D), { address: KEY_D, name: null });
+  const views = communityViews(true);
+  assert.deepEqual(Object.fromEntries(views.map((c) => [c.publicKey, c.review])), { [KEY_C]: 'blocked', [KEY_D]: 'hidden' });
+  assert.equal(views.find((c) => c.publicKey === KEY_C)?.reason, 'report');
+  assert.equal(views.find((c) => c.publicKey === KEY_D)?.nsfw, true);
+  assert.deepEqual(communityViews(false), [], 'neither is listed publicly');
+  assert.equal(getCandidate('leak.bso'), undefined, 'a blocked community is not harvested');
+  assert.deepEqual(sourcesOf('next.bso'), [`mention:${KEY_D}`], 'a hidden one still is');
+
+  // Not fetched again under its key, although the name it claims never resolved.
+  makeDue(KEY_C);
+  await tick();
+  assert.equal(calls.communities.filter((a) => a === KEY_C).length, 1, 'not fetched again under its key');
+  assert.ok(getCandidate(KEY_C)!.next_check_at > nowSec() + 24 * 3600);
+});
+
+test('a block on any address of a known community stops it being fetched under its other addresses', async () => {
+  // A list entry that names a community by name and key makes two candidates for one community.
+  const spam = { name: 'spam.bso', publicKey: KEY_C, description: 'see leak.bso' };
+  const other = { name: 'other.bso', publicKey: KEY_D };
+  const calls = fakePkc({ 'spam.bso': spam, [KEY_C]: spam, 'other.bso': other, [KEY_D]: other });
+  addCandidate('spam.bso', 'seed', 'list.json', nowSec());
+  addCandidate(KEY_C, 'seed', 'list.json', nowSec());
+  addCandidate('other.bso', 'seed', 'list.json', nowSec());
+  const fetchesOf = (...addresses: string[]) => calls.communities.filter((a) => addresses.includes(a)).length;
+  await tick();
+  assert.equal(fetchesOf('spam.bso', KEY_C, 'other.bso'), 3);
+
+  setOverrides(parseOverrides([{ address: 'spam.bso', status: 'blocked' }, { address: 'other.bso', status: 'blocked' }]));
+  makeDue('spam.bso');
+  makeDue(KEY_C);
+  // A crosspost names other.bso's community by its key after the block.
+  addCandidate(KEY_D, 'crosspost', 'elsewhere.bso', nowSec());
+  await tick();
+  assert.equal(fetchesOf('spam.bso', KEY_C, 'other.bso', KEY_D), 3, 'no address of either is fetched again');
+  assert.ok(getCandidate(KEY_C)!.next_check_at > nowSec() + 24 * 3600);
+  assert.ok(getCandidate(KEY_D)!.next_check_at > nowSec() + 24 * 3600);
+});
+
 test('refreshSources reads indexer communities and credits comment pointers to their community', async () => {
   fakePkc({});
   mutableConfig.indexerUrls = ['https://idx.example'];
@@ -220,4 +326,185 @@ test('refreshSources reads indexer communities and credits comment pointers to t
   assert.deepEqual(sourcesOf('indexed.bso'), ['indexer:https://idx.example']);
   assert.deepEqual(sourcesOf('elsewhere.bso'), ['mention:indexed.bso']);
   assert.deepEqual(sourcesOf('origin.bso'), ['crosspost:indexed.bso']);
+});
+
+test('a chain hop cut short by its check deadline leaves alone a client another check is still using', async () => {
+  const pending = new Set<(err: Error) => void>();
+  // Settles after `ms`, unless the client is destroyed first.
+  const later = (ms: number, value: unknown) =>
+    new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(fail);
+        resolve(value);
+      }, ms);
+      const fail = (err: Error) => {
+        clearTimeout(timer);
+        reject(err);
+      };
+      pending.add(fail);
+    });
+  const withChain = { raw: { comment: { author: { previousCommentCid: CID_1 } } } };
+  const communities: Record<string, [number, unknown]> = {
+    'a.bso': [0, { name: 'a.bso', publicKey: KEY_A, posts: { pages: { hot: { comments: [withChain] } } } }],
+    'b.bso': [200, { name: 'b.bso', publicKey: KEY_B }],
+    'c.bso': [300, { name: 'c.bso', publicKey: KEY_C }],
+  };
+  const client: PkcClient = {
+    getCommunity: (address) => later(...communities[address]!),
+    // No node serves the comment: the hop runs until a.bso's check deadline.
+    getComment: () => later(60_000, {}),
+    destroy: async () => {
+      for (const fail of pending) fail(new Error('client destroyed'));
+      pending.clear();
+    },
+  };
+  // The real getPkcClient serves this client, so a reset reaches it as it would in production.
+  setDepsForTest(null);
+  setPkcClientForTest(Promise.resolve(client));
+  const savedTimeout = config.checkTimeoutMs;
+  mutableConfig.checkTimeoutMs = 400;
+  try {
+    for (const address of Object.keys(communities)) addCandidate(address, 'seed', 'SEEDS', nowSec());
+    // Two workers: a.bso's hop runs out at 400 ms, while c.bso's check (200 to 500 ms) is still waiting.
+    assert.equal(await tick(), 3);
+  } finally {
+    mutableConfig.checkTimeoutMs = savedTimeout;
+    setPkcClientForTest(null);
+  }
+  const c = getCandidate('c.bso')!;
+  assert.deepEqual({ failures: c.failures, error: c.last_error, key: c.public_key }, { failures: 0, error: null, key: KEY_C });
+  assert.equal(getCandidate('a.bso')!.failures, 0);
+});
+
+test('the end-of-tick client recycle leaves alone a client a source refresh is still using', async () => {
+  let destroyed = 0;
+  let commentAsked!: () => void;
+  const asked = new Promise<void>((resolve) => (commentAsked = resolve));
+  let answerComment!: (comment: unknown) => void;
+  const client: PkcClient = {
+    getCommunity: async () => ({ name: 'a.bso', publicKey: KEY_A }),
+    getComment: () => {
+      commentAsked();
+      return new Promise((resolve) => (answerComment = resolve));
+    },
+    destroy: async () => {
+      destroyed++;
+    },
+  };
+  // The real getPkcClient serves this client, so tick() recycles it as it would in production.
+  setDepsForTest(null);
+  setPkcClientForTest(Promise.resolve(client));
+  mutableConfig.indexerUrls = ['https://idx.example'];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    if (String(input).endsWith('/api/communities')) return new Response(JSON.stringify({ communities: [] }));
+    const raw = JSON.stringify({ comment: { author: { previousCommentCid: CID_1 } } });
+    return new Response(
+      JSON.stringify({
+        posts: [{ cid: CID_2, community_address: 'indexed.bso', timestamp: nowSec() - 10, raw }],
+      }),
+    );
+  }) as typeof fetch;
+  const refresh = refreshSources();
+  try {
+    await asked;
+    addCandidate('a.bso', 'seed', 'SEEDS', nowSec());
+    assert.equal(await tick(), 1);
+    assert.equal(destroyed, 0, 'the client the refresh is waiting on is not destroyed under it');
+  } finally {
+    answerComment?.({ communityAddress: 'chained.bso' });
+    await refresh;
+    globalThis.fetch = realFetch;
+    setPkcClientForTest(null);
+  }
+  assert.deepEqual(sourcesOf('chained.bso'), ['author-chain:indexed.bso']);
+});
+
+test('lifting a block makes the community due again at once', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'discovery-unblock-'));
+  const file = join(dir, 'overrides.json');
+  const writeOverrides = async (entries: unknown[], mtimeSec: number) => {
+    await writeFile(file, JSON.stringify(entries));
+    await utimes(file, mtimeSec, mtimeSec);
+    await pollOverrides(file);
+  };
+  const calls = fakePkc({
+    'bad.bso': { name: 'bad.bso', publicKey: KEY_A },
+    // Its record claims a name that never resolves to it.
+    [KEY_B]: { name: 'claimed.bso', publicKey: KEY_B },
+  });
+  const fetchesOf = (address: string) => calls.communities.filter((a) => a === address).length;
+  const blocked = ['bad.bso', KEY_B];
+  try {
+    addCandidate('bad.bso', 'seed', 'SEEDS', nowSec());
+    addCandidate(KEY_B, 'ens', '0xnode', nowSec());
+    await tick();
+    assert.deepEqual(blocked.map(fetchesOf), [1, 1]);
+
+    // Blocked by its key, and by the name it claims: the next check is pushed back by RETRY_MAX_MS.
+    await writeOverrides([{ address: KEY_A, status: 'blocked' }, { address: 'claimed.bso', status: 'blocked' }], 1_000_000);
+    blocked.forEach(makeDue);
+    await tick();
+    assert.deepEqual(blocked.map(fetchesOf), [1, 1]);
+    for (const address of blocked) assert.ok(getCandidate(address)!.next_check_at > nowSec() + 24 * 3600);
+
+    await writeOverrides([], 2_000_000);
+    for (const address of blocked) {
+      assert.ok(getCandidate(address)!.next_check_at <= nowSec(), `${address} is due again once the block is lifted`);
+    }
+    await tick();
+    assert.deepEqual(blocked.map(fetchesOf), [2, 2]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a block lifted while the service was down makes the community due when it starts again', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'discovery-unblock-'));
+  const file = join(dir, 'overrides.json');
+  const calls = fakePkc({ 'bad.bso': { name: 'bad.bso', publicKey: KEY_A }, 'worse.bso': { name: 'worse.bso', publicKey: KEY_B } });
+  const fetchesOf = (address: string) => calls.communities.filter((a) => a === address).length;
+  const deferred = (address: string) => getCandidate(address)!.next_check_at > nowSec() + 24 * 3600;
+  // A restart: the verdicts in memory are gone, the database is not.
+  const restart = async (source: string) => {
+    stopOverrides();
+    setOverrides(new Map());
+    mutableConfig.overridesSource = source;
+    await startOverrides();
+  };
+  try {
+    await writeFile(file, JSON.stringify([{ address: 'bad.bso', status: 'blocked' }, { address: KEY_B, status: 'blocked' }]));
+    await restart(file);
+    addCandidate('bad.bso', 'seed', 'SEEDS', nowSec());
+    addCandidate('worse.bso', 'seed', 'SEEDS', nowSec());
+    await tick();
+    // worse.bso is blocked by its key, which is only known once it has been fetched.
+    assert.deepEqual(['bad.bso', 'worse.bso'].map(fetchesOf), [0, 1]);
+    makeDue('worse.bso');
+    await tick();
+    assert.ok(deferred('bad.bso') && deferred('worse.bso'));
+
+    // A start that cannot load the file refuses to run and changes nothing.
+    await rm(file);
+    await assert.rejects(restart(file), /could not be loaded/);
+    assert.ok(deferred('bad.bso') && deferred('worse.bso'));
+
+    // bad.bso's block is lifted while the service is down.
+    await writeFile(file, JSON.stringify([{ address: KEY_B, status: 'blocked' }]));
+    await restart(file);
+    assert.ok(!deferred('bad.bso'), 'bad.bso is due at once');
+    assert.ok(deferred('worse.bso'), 'worse.bso is still blocked');
+    await tick();
+    assert.deepEqual(['bad.bso', 'worse.bso'].map(fetchesOf), [1, 1]);
+
+    // Started without OVERRIDES_SOURCE: the blocks the last run applied are lifted too.
+    await restart('');
+    assert.ok(!deferred('worse.bso'), 'worse.bso is due at once');
+    await tick();
+    assert.deepEqual(['bad.bso', 'worse.bso'].map(fetchesOf), [1, 2]);
+  } finally {
+    stopOverrides();
+    mutableConfig.overridesSource = '';
+    await rm(dir, { recursive: true, force: true });
+  }
 });

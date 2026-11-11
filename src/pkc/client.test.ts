@@ -71,3 +71,32 @@ test('a second reset retires a replacement installed while the first reset is pe
   await Promise.all([resetA, resetB]);
   setPkcClientForTest(null);
 });
+
+test('a reset for a client that was already replaced leaves the replacement alone', async () => {
+  let destroyedA = 0;
+  let destroyedB = 0;
+  const a = client(async () => {
+    destroyedA++;
+  });
+  const b = client(async () => {
+    destroyedB++;
+  });
+
+  const connectedA = Promise.resolve(a);
+  setPkcClientForTest(connectedA);
+  await connectedA;
+  // Two calls run on A. The first times out and resets it; the next call connects B.
+  await resetPkcClient({ client: a });
+  assert.equal(destroyedA, 1);
+  const connectedB = Promise.resolve(b);
+  setPkcClientForTest(connectedB);
+  await connectedB;
+
+  // The second call on A times out later: B is healthy and must survive.
+  await resetPkcClient({ client: a });
+  assert.equal(destroyedB, 0);
+
+  await resetPkcClient({ client: b });
+  assert.equal(destroyedB, 1);
+  setPkcClientForTest(null);
+});

@@ -153,9 +153,18 @@ key, or an alias it was found under):
 | `hidden` | no | yes | yes |
 | `blocked` | no | no, once its key is known | no |
 
+A community whose record claims a name gets that name's verdict once
+discovery has seen the name resolve to it. Until then only a restriction
+carries over (`hidden`, `blocked`, `nsfw: true`): a record cannot borrow
+another community's approval, and a name blocked before it ever resolved
+still blocks whatever claims it.
+
 When aliases of one community disagree, the strictest status wins. `nsfw`
 overrides the owner's `features.safeForWork`. `reason` is only returned to
-admin requests. The file is re-read whenever it changes.
+admin requests. The file is re-read whenever it changes. If it is set but
+cannot be read or parsed at startup, the service exits instead of running
+without it; later, a broken or unreadable file keeps the previous verdicts
+and a deleted one clears them.
 
 ## API
 

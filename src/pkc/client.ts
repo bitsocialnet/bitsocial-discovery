@@ -34,6 +34,9 @@ let quietReconnect = false;
  */
 let generation = 0;
 
+/** The generation each client was connected in, so a reset can tell whether it is still current. */
+const generationOf = new WeakMap<PkcClient, number>();
+
 /**
  * Keep credentials and opaque path segments out of logs. PKC RPC uses the
  * first URL path segment as the remote authentication key, and URLs may also
@@ -83,8 +86,14 @@ export function getPkcClient(): Promise<PkcClient> {
  * connect log line of the replacement). Clearing the cache first lets new work
  * reconnect immediately; the generation guard keeps the old client's late
  * teardown from evicting that replacement.
+ *
+ * A caller resetting after its own call timed out passes the `client` that
+ * call ran on, and the reset does nothing once that client is no longer the
+ * current one: two calls that time out on the same client must not take down
+ * the healthy replacement the first reset let other work connect.
  */
-export function resetPkcClient(opts: { quiet?: boolean } = {}): Promise<void> {
+export function resetPkcClient(opts: { quiet?: boolean; client?: PkcClient } = {}): Promise<void> {
+  if (opts.client && generationOf.get(opts.client) !== generation) return resetPromise ?? Promise.resolve();
   const doomed = clientPromise;
   clientPromise = null;
   if (!doomed) return resetPromise ?? Promise.resolve();
@@ -105,6 +114,12 @@ export function resetPkcClient(opts: { quiet?: boolean } = {}): Promise<void> {
 /** Test seam for exercising reset ordering without opening a real RPC socket. */
 export function setPkcClientForTest(client: Promise<PkcClient> | null): void {
   clientPromise = client;
+  if (!client) return;
+  const gen = ++generation;
+  void client.then(
+    (connected) => generationOf.set(connected, gen),
+    () => {},
+  );
 }
 
 async function connect(gen: number): Promise<PkcClient> {
@@ -142,7 +157,7 @@ async function connect(gen: number): Promise<PkcClient> {
     }
   }
 
-  return {
+  const client: PkcClient = {
     getCommunity: (address) => call(() => pkc.getCommunity({ address })),
     getComment: (cid) => call(() => pkc.getComment({ cid })),
     destroy: async () => {
@@ -150,4 +165,6 @@ async function connect(gen: number): Promise<PkcClient> {
       await pkc.destroy?.();
     },
   };
+  generationOf.set(client, gen);
+  return client;
 }
